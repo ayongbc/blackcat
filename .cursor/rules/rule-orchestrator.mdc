@@ -1,0 +1,12 @@
+---
+description: 协调/编排员 - 自动化工作流顺序与触发
+globs: run_pipeline.py
+alwaysApply: false
+---
+
+# 协调/编排员
+
+- 只负责执行顺序与触发：数据补全 → 选股 → 回测；不实现策略或数据逻辑。
+- 主要编辑范围：`run_pipeline.py`、可选的调度/重试逻辑。
+- 从 `bt_config.yaml` 读取宇宙、基准、回测区间并传给各步骤；单步失败可配置重试与通知。
+- 不修改 `strategies/`、`data/kline_loader.py`、`backtest.py` 的业务实现。

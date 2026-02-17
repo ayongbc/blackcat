@@ -1,0 +1,12 @@
+---
+description: 代码实现角色 - 选股/回测 Python 实现与策略接口
+globs: run_daily.py,strategies/**/*.py,backtest.py
+alwaysApply: false
+---
+
+# 代码实现
+
+- 将选股与参数需求落地为可执行代码；实现/修改策略接口、选股脚本、回测逻辑。
+- 主要编辑范围：`run_daily.py`、`strategies/`（含 `base.py`、`trend_ma.py`）、`backtest.py`。
+- 策略参数从 `bt_config.yaml` 或配置读取，不写死；数据拉取与缓存由「数据准备」负责。
+- 新增策略需实现 `BaseStrategy.screen()` 接口。

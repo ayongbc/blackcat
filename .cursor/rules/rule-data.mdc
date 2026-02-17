@@ -1,0 +1,11 @@
+---
+description: 数据准备角色 - K 线、宇宙、补全与缓存
+globs: data/**/*.py,supplement_kline.py
+alwaysApply: false
+---
+
+# 数据准备
+
+- 只负责 K 线拉取、补全、宇宙列表、缓存与目录；不修改策略或回测引擎。
+- 主要编辑范围：`data/kline_loader.py`、`data/universe.py`、`supplement_kline.py`、`data/kline/`、`data/state.json`。
+- 保证 `load_kline`、`get_stock_list`、`get_trading_dates` 等接口可用且格式一致。

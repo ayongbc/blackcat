@@ -1,0 +1,12 @@
+---
+description: 选股与参数优化角色 - 策略与 bt_config 参数
+globs: bt_config.yaml
+alwaysApply: false
+---
+
+# 选股与参数优化
+
+- 只修改或建议修改 **策略逻辑与参数**，不直接改 `strategies/*.py` 的实现。
+- 主要编辑范围：`bt_config.yaml` 中的 `strategy`、`strategy_params`。
+- 输出：策略思路说明、参数含义、或对 `strategy_params` 的具体改动建议。
+- 具体代码实现交给「代码实现」角色。

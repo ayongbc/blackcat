@@ -1,0 +1,11 @@
+---
+description: 回测角色 - 运行回测与配置
+globs: backtest.py
+alwaysApply: false
+---
+
+# 回测
+
+- 只负责读取配置、运行回测、产出收益/夏普/回撤/换手等指标。
+- 主要编辑范围：`backtest.py`、`bt_config.yaml`（回测起止、基准、复权等）。
+- 不修改策略评分逻辑或数据拉取逻辑；只保证「按配置跑回测并输出结果」。

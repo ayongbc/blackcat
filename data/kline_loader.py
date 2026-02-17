@@ -3,12 +3,15 @@ K线数据加载与获取模块
 支持按日期范围加载，供回测和日频筛选复用
 """
 
+import logging
 import os
 import time
 from typing import Optional
 
 import pandas as pd
 import baostock as bs
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 KLINE_DIR = os.path.join(DATA_DIR, "kline")
@@ -48,6 +51,37 @@ def fetch_kline(
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
     return df
+
+
+def fetch_kline_with_retry(
+    code: str,
+    start_date: str,
+    end_date: str,
+    adjustflag: str = "2",
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+) -> pd.DataFrame:
+    """带重试的 K 线拉取，失败时记录日志并重试"""
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            df = fetch_kline(code, start_date, end_date, adjustflag)
+            if attempt > 0:
+                logger.info("  [%s] 重试第 %d 次成功", code, attempt + 1)
+            return df
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "  [%s] 拉取失败 (尝试 %d/%d): %s",
+                code,
+                attempt + 1,
+                max_retries,
+                str(e),
+            )
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+    logger.error("  [%s] 拉取失败，已重试 %d 次: %s", code, max_retries, last_err)
+    raise last_err
 
 
 def load_kline(
@@ -124,64 +158,105 @@ def supplement_kline(
     end_date: str,
     adjustflag: str = "2",
     sleep_s: float = 0.02,
-) -> int:
+    max_retries: int = 3,
+    retry_delay: float = 2.0,
+    verbose: bool = True,
+) -> tuple[int, int]:
     """
     批量补充 K 线数据到本地
-    返回实际发起 API 请求的次数
+    返回 (API 请求次数, 失败数)
     """
     _ensure_kline_dir()
     api_count = 0
+    fail_count = 0
 
     for i, code in enumerate(codes):
-        if (i + 1) % 50 == 0:
-            print(f"  已处理 {i + 1}/{len(codes)} 只...", flush=True)
+        if verbose and (i + 1) % 50 == 0:
+            print(f"  已处理 {i + 1}/{len(codes)} 只 (API {api_count} 次, 失败 {fail_count})...", flush=True)
 
         path = os.path.join(KLINE_DIR, code.replace(".", "_") + ".csv")
         need_fetch = True
+        did_fetch = False
 
-        if os.path.exists(path):
-            old = pd.read_csv(path, parse_dates=["date"])
-            old["date"] = pd.to_datetime(old["date"])
-            first = old["date"].min()
-            last = old["date"].max()
-            start_dt = pd.to_datetime(start_date)
-            end_dt = pd.to_datetime(end_date)
+        try:
+            if os.path.exists(path):
+                old = pd.read_csv(path, parse_dates=["date"])
+                old["date"] = pd.to_datetime(old["date"])
+                first = old["date"].min()
+                last = old["date"].max()
+                start_dt = pd.to_datetime(start_date)
+                end_dt = pd.to_datetime(end_date)
 
-            if first <= start_dt and last >= end_dt:
-                need_fetch = False
-            else:
-                if last < end_dt:
-                    start_date_actual = (last + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                    new = fetch_kline(code, start_date_actual, end_date, adjustflag)
-                    api_count += 1
-                    if len(new) > 0:
-                        df = (
-                            pd.concat([old, new], ignore_index=True)
-                            .drop_duplicates(subset=["date"])
-                            .sort_values("date")
+                if first <= start_dt and last >= end_dt:
+                    need_fetch = False
+                    if verbose and (i + 1) <= 10:
+                        logger.debug("  [%s] 已有完整数据，跳过", code)
+                else:
+                    if last < end_dt:
+                        start_date_actual = (last + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                        if verbose:
+                            print(f"  [{i+1}/{len(codes)}] {code} 向后补充 {start_date_actual}~{end_date}", flush=True)
+                        api_count += 1
+                        did_fetch = True
+                        new = fetch_kline_with_retry(
+                            code, start_date_actual, end_date, adjustflag,
+                            max_retries=max_retries, retry_delay=retry_delay,
                         )
-                        df.to_csv(path, index=False)
-                if first > start_dt:
-                    end_date_actual = (first - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-                    new = fetch_kline(code, start_date, end_date_actual, adjustflag)
-                    api_count += 1
-                    if len(new) > 0:
-                        old = pd.read_csv(path, parse_dates=["date"])
-                        df = (
-                            pd.concat([new, old], ignore_index=True)
-                            .drop_duplicates(subset=["date"])
-                            .sort_values("date")
+                        if len(new) > 0:
+                            df = (
+                                pd.concat([old, new], ignore_index=True)
+                                .drop_duplicates(subset=["date"])
+                                .sort_values("date")
+                            )
+                            df.to_csv(path, index=False)
+                        else:
+                            fail_count += 1
+                            logger.warning("  [%s] 返回空数据", code)
+                    if first > start_dt:
+                        end_date_actual = (first - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                        if verbose:
+                            print(f"  [{i+1}/{len(codes)}] {code} 向前补充 {start_date}~{end_date_actual}", flush=True)
+                        api_count += 1
+                        did_fetch = True
+                        new = fetch_kline_with_retry(
+                            code, start_date, end_date_actual, adjustflag,
+                            max_retries=max_retries, retry_delay=retry_delay,
                         )
-                        df.to_csv(path, index=False)
-                need_fetch = False
+                        if len(new) > 0:
+                            old = pd.read_csv(path, parse_dates=["date"])
+                            df = (
+                                pd.concat([new, old], ignore_index=True)
+                                .drop_duplicates(subset=["date"])
+                                .sort_values("date")
+                            )
+                            df.to_csv(path, index=False)
+                        else:
+                            fail_count += 1
+                            logger.warning("  [%s] 返回空数据", code)
+                    need_fetch = False
 
-        if need_fetch:
-            df = fetch_kline(code, start_date, end_date, adjustflag)
-            api_count += 1
-            if len(df) > 0:
-                df.to_csv(path, index=False)
+            if need_fetch:
+                if verbose:
+                    print(f"  [{i+1}/{len(codes)}] {code} 全量拉取 {start_date}~{end_date}", flush=True)
+                api_count += 1
+                did_fetch = True
+                df = fetch_kline_with_retry(
+                    code, start_date, end_date, adjustflag,
+                    max_retries=max_retries, retry_delay=retry_delay,
+                )
+                if len(df) > 0:
+                    df.to_csv(path, index=False)
+                else:
+                    fail_count += 1
+                    logger.warning("  [%s] 返回空数据", code)
 
-        if sleep_s > 0 and api_count > 0:
-            time.sleep(sleep_s)
+            if sleep_s > 0 and did_fetch:
+                time.sleep(sleep_s)
 
-    return api_count
+        except Exception as e:
+            fail_count += 1
+            logger.exception("  [%s] 处理失败: %s", code, e)
+            print(f"  [ERROR] {code} 失败: {e}", flush=True)
+            continue
+
+    return api_count, fail_count

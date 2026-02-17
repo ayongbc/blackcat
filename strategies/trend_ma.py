@@ -1,14 +1,20 @@
 """
 趋势均线选股策略
 与 run_daily.py 中的逻辑一致，通过 config 可配置
+支持 pool_workers > 1 时多进程并行评分以加速回测
 """
 
 import math
+import os
+from multiprocessing import Pool
 from typing import Any
 
 import pandas as pd
 
 from .base import BaseStrategy
+
+# 多进程时每个子进程需独立登录 BaoStock，用 pid 记录避免重复登录
+_bs_login_pid = None
 
 # 默认策略参数（可被 bt_config 覆盖）
 DEFAULT_CONFIG = {
@@ -24,7 +30,32 @@ DEFAULT_CONFIG = {
     "min_score": 25.0,
     "pool_size": 50,
     "adjustflag": "2",
+    "pool_workers": 0,  # 回测时并行评分进程数，0=不并行
 }
+
+
+def _score_one_stock(args: tuple) -> dict[str, Any] | None:
+    """供多进程调用的单只股票评分，仅用可序列化参数，内部自行 load_kline"""
+    global _bs_login_pid
+    pid = os.getpid()
+    if _bs_login_pid != pid:
+        import baostock as bs
+        bs.login()
+        _bs_login_pid = pid
+
+    code, name, date, benchmark_ret20, config = args
+    from data.kline_loader import load_kline
+    min_bars = config.get("min_bars", 160)
+    adjustflag = config.get("adjustflag", "2")
+    df = load_kline(code, date, lookback_days=500, adjustflag=adjustflag)
+    if df is None or df.empty or len(df) < min_bars:
+        return None
+    if "code" not in df.columns:
+        df["code"] = code
+    scored = _score_one(df, benchmark_ret20, config)
+    if scored:
+        scored["name"] = name
+    return scored
 
 
 def _ma(s: pd.Series, n: int) -> pd.Series:
@@ -144,19 +175,29 @@ class TrendMAStrategy(BaseStrategy):
     ) -> list[dict[str, Any]]:
         min_bars = self.config.get("min_bars", 160)
         pool_size = self.config.get("pool_size", 50)
-        rows = []
+        n_workers = int(self.config.get("pool_workers") or 0)
 
-        for _, r in universe_df.iterrows():
-            code, name = r["code"], r["code_name"]
-            df = get_kline_fn(code, date)
-            if df is None or df.empty or len(df) < min_bars:
-                continue
-            if "code" not in df.columns:
-                df["code"] = code
-            scored = _score_one(df, benchmark_ret20, self.config)
-            if scored:
-                scored["name"] = name
-                rows.append(scored)
+        if n_workers > 1:
+            args_list = [
+                (r["code"], r["code_name"], date, benchmark_ret20, self.config)
+                for _, r in universe_df.iterrows()
+            ]
+            with Pool(processes=n_workers) as pool:
+                results = pool.map(_score_one_stock, args_list)
+            rows = [r for r in results if r is not None]
+        else:
+            rows = []
+            for _, r in universe_df.iterrows():
+                code, name = r["code"], r["code_name"]
+                df = get_kline_fn(code, date)
+                if df is None or df.empty or len(df) < min_bars:
+                    continue
+                if "code" not in df.columns:
+                    df["code"] = code
+                scored = _score_one(df, benchmark_ret20, self.config)
+                if scored:
+                    scored["name"] = name
+                    rows.append(scored)
 
         out = pd.DataFrame(rows)
         if out.empty:

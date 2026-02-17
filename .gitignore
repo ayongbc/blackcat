@@ -17,7 +17,7 @@ build/
 *.log
 
 # 项目：生成的数据与输出
-data/kline/
+
 data/partial_*.csv
 data/state.json
 output/
