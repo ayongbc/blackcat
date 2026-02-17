@@ -161,6 +161,7 @@ def run_backtest(config: dict) -> dict:
     max_positions = int(config.get("max_positions", 5))
     if max_positions < 1:
         max_positions = 1
+    exit_by_score_rank = bool(config.get("exit_by_score_rank", False))
 
     strategy_params["pool_size"] = strategy_params.get("pool_size", pool_size)
     strategy_cls = get_strategy(strategy_name)
@@ -189,7 +190,9 @@ def run_backtest(config: dict) -> dict:
             parts.append(f"破MA20 {config.get('break_ma20_pct')}%卖出")
         print(f"  止盈止损: {', '.join(parts)}", flush=True)
     print(f"  初始资金: {initial_capital:,.0f} 元，最多持仓: {max_positions} 只", flush=True)
-    print("  规则: T+1（买入日不卖），选股次日开盘买，持有至止盈/止损/破MA20 触发才卖", flush=True)
+    if exit_by_score_rank:
+        print("  调仓: 积分排序（每日只保留当日选股池 score 前 N 名，其余调出）", flush=True)
+    print("  规则: T+1（买入日不卖），选股次日开盘买，持有至止盈/止损/破MA20 或积分调出", flush=True)
     print("  开始循环...", flush=True)
 
     price_cache = {}
@@ -256,11 +259,32 @@ def run_backtest(config: dict) -> dict:
         # 2) 检查退出：仅对 buy_date < t 的持仓检查（T+1 买入日不卖），用当日 high/low 判断
         exited_today = []
         still_held = []
+        # 积分排序调仓：当日池子已按 score 排序，只保留在当日 top max_positions 内的持仓
+        top_codes = set(r["code"] for r in pool[:max_positions]) if (exit_by_score_rank and pool) else set()
         for p in positions:
             if p["buy_date"] == t:
                 still_held.append(p)
                 continue
             code, buy_price = p["code"], p["buy_price"]
+            # 积分排序：不在当日 top N 则调出
+            if top_codes and code not in top_codes:
+                exit_p_sr = _get_price(price_cache, code, t, "close", get_kline_fn) or buy_price
+                exited_today.append({
+                    **p,
+                    "sell_date": t,
+                    "exit_reason": "score_rank",
+                    "exit_price": exit_p_sr,
+                })
+                all_trades.append({
+                    "code": p["code"],
+                    "name": p["name"],
+                    "buy_date": p["buy_date"],
+                    "sell_date": t,
+                    "exit_reason": "score_rank",
+                    "entry": p["buy_price"],
+                    "exit_price": exit_p_sr,
+                })
+                continue
             high_t = _get_price(price_cache, code, t, "high", get_kline_fn)
             low_t = _get_price(price_cache, code, t, "low", get_kline_fn)
             if high_t is None or low_t is None:
@@ -364,8 +388,11 @@ def run_backtest(config: dict) -> dict:
     }
 
 
-def _write_detailed_report(config: dict, result: dict, report_path: Path, csv_dir: Path) -> None:
-    """生成详细回测报告（含月度收益、日收益统计、样本池、曲线数据 CSV）"""
+def _write_detailed_report(
+    config: dict, result: dict, report_path: Path, csv_dir: Path, report_timestamp: str | None = None
+) -> None:
+    """生成详细回测报告（含月度收益、日收益统计、样本池、曲线数据 CSV）。
+    report_timestamp 非空时 CSV 与报告内文件名使用时间戳，避免覆盖历史结果。"""
     start_date = config.get("start_date", "")
     end_date = config.get("end_date", "")
     strategy_name = config.get("strategy", "trend_ma")
@@ -425,6 +452,7 @@ def _write_detailed_report(config: dict, result: dict, report_path: Path, csv_di
     stop_str = f"止损 {sl_pct}%" if sl_pct is not None else "不止损"
     target_str = f"止盈 {tp_pct}%" if tp_pct is not None else "不止盈"
     break_str = f"破MA20 {bm_pct}%卖出" if bm_pct is not None else "无"
+    rank_str = "积分排序（只保留当日 score 前 N）" if config.get("exit_by_score_rank") else "无"
     lines = [
         "# 回测详细报告",
         "",
@@ -432,7 +460,7 @@ def _write_detailed_report(config: dict, result: dict, report_path: Path, csv_di
         f"- **宇宙**: {universe}",
         f"- **基准**: {benchmark}",
         f"- **区间**: {start_date} ~ {end_date}",
-        f"- **止盈止损**: {stop_str}, {target_str}, {break_str}",
+        f"- **止盈止损**: {stop_str}, {target_str}, {break_str}；**调仓**: {rank_str}",
         f"- **初始资金**: {config.get('initial_capital', 500000):,.0f} 元，**最多持仓**: {config.get('max_positions', 5)} 只",
         "",
         "## 1. 收益与风险汇总",
@@ -494,8 +522,10 @@ def _write_detailed_report(config: dict, result: dict, report_path: Path, csv_di
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-    # 日频曲线 CSV
-    csv_path = csv_dir / "backtest_daily.csv"
+    # 日频曲线 CSV（带时间戳时防覆盖）
+    daily_suffix = f"_{report_timestamp}" if report_timestamp else ""
+    csv_daily_name = f"backtest_daily{daily_suffix}.csv"
+    csv_path = csv_dir / csv_daily_name
     if trade_dates and len(trade_dates) == len(daily_returns) and len(trade_dates) == len(cum):
         df_curve = pd.DataFrame({
             "date": trade_dates,
@@ -522,13 +552,15 @@ def _write_detailed_report(config: dict, result: dict, report_path: Path, csv_di
             else:
                 row["ret_pct"] = ""
             all_trades.append(row)
+    trades_suffix = f"_{report_timestamp}" if report_timestamp else ""
+    csv_trades_name = f"backtest_trades{trades_suffix}.csv"
     if all_trades:
-        pd.DataFrame(all_trades).to_csv(csv_dir / "backtest_trades.csv", index=False, encoding="utf-8-sig")
+        pd.DataFrame(all_trades).to_csv(csv_dir / csv_trades_name, index=False, encoding="utf-8-sig")
     with open(report_path, "a", encoding="utf-8") as f:
         f.write("## 5. 数据文件\n\n")
-        f.write("- 日频曲线: `output/backtest_daily.csv`（date, daily_return, cumulative）\n")
+        f.write(f"- 日频曲线: `output/{csv_daily_name}`（date, daily_return, cumulative）\n")
         if all_trades:
-            f.write("- 全部交易明细: `output/backtest_trades.csv`（hold_date, code, name, buy_date, sell_date, exit_reason, entry, exit_price, ret_pct）\n")
+            f.write(f"- 全部交易明细: `output/{csv_trades_name}`（hold_date, code, name, buy_date, sell_date, exit_reason, entry, exit_price, ret_pct）\n")
 
 
 def main():
@@ -580,11 +612,16 @@ def main():
 
         out_dir = Path("output")
         out_dir.mkdir(exist_ok=True)
-        report_path = out_dir / "backtest_report.md"
-        _write_detailed_report(config, result, report_path, out_dir)
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = out_dir / f"backtest_report_{ts}.md"
+        _write_detailed_report(config, result, report_path, out_dir, report_timestamp=ts)
         print(f"\n报告已保存: {report_path}", flush=True)
-        if (out_dir / "backtest_daily.csv").exists():
-            print(f"日频曲线已保存: {out_dir / 'backtest_daily.csv'}", flush=True)
+        csv_daily = out_dir / f"backtest_daily_{ts}.csv"
+        csv_trades = out_dir / f"backtest_trades_{ts}.csv"
+        if csv_daily.exists():
+            print(f"日频曲线已保存: {csv_daily}", flush=True)
+        if csv_trades.exists():
+            print(f"交易明细已保存: {csv_trades}", flush=True)
 
     finally:
         bs.logout()
