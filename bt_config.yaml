@@ -1,0 +1,25 @@
+# 回测配置文件
+# 支持通过命令行 --strategy, --start, --end 覆盖
+
+strategy: trend_ma
+
+strategy_params:
+  pool_size: 20
+  min_avg_amount_20: 50000000
+  min_bars: 160
+  pullback_touch_tol: 0.02
+  breakout_vol_ratio: 1.5
+  max_close_over_ma20: 1.08
+  min_rs20: 0.0
+  min_days_above_ma120: 30
+  min_trend_days: 10
+  pullback_max_vol_ratio: 1.2
+  min_score: 25.0
+
+universe: zz500
+benchmark: sh.000852
+adjustflag: "2"
+allow_bj: false
+
+start_date: "2023-01-01"
+end_date: null  # null 表示到今天

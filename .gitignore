@@ -1,0 +1,33 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 本地/环境
+.env
+.env.local
+*.log
+
+# 项目：生成的数据与输出
+data/kline/
+data/partial_*.csv
+data/state.json
+output/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
