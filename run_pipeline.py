@@ -53,7 +53,12 @@ def main():
     root = Path(__file__).resolve().parent
     config = load_config(args.config)
     universe = config.get("universe", "zz500")
-    benchmark = config.get("benchmark", "sh.000852")
+    benchmark_cfg = config.get("benchmark", "sh.000905")
+    benchmark = (
+        benchmark_cfg.get(universe) or benchmark_cfg.get("default") or "sh.000905"
+        if isinstance(benchmark_cfg, dict)
+        else (str(benchmark_cfg) if benchmark_cfg else "sh.000905")
+    )
     start_date = config.get("start_date") or "2023-01-01"
     end_date = config.get("end_date")
     if end_date is None or end_date == "" or str(end_date).lower() == "null":

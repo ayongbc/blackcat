@@ -113,12 +113,13 @@ def _score_one(df: pd.DataFrame, bench_ret20: float, config: dict) -> dict[str, 
     vol_ratio = float(d["volume"]) / float(d["vol_ma20"]) if float(d["vol_ma20"]) > 0 else 0
     is_breakout = (close >= float(prev20_max_close)) and (vol_ratio >= cfg["breakout_vol_ratio"])
 
+    # 回踩：最近 2 天（不含当日）都在 MA20±tol 内触及，且当日缩量，当日收盘 > MA20
     tol = cfg["pullback_touch_tol"]
-    recent = df.iloc[-6:-1]
+    last_2 = df.iloc[-3:-1]  # 倒数第3、第2根（最近 2 个交易日）
     touched = (
-        (recent["low"] <= recent["ma20"] * (1 + tol))
-        & (recent["low"] >= recent["ma20"] * (1 - tol))
-    ).any()
+        (last_2["low"] <= last_2["ma20"] * (1 + tol))
+        & (last_2["low"] >= last_2["ma20"] * (1 - tol))
+    ).all()
     is_pullback = touched and (close > ma20v) and (vol_ratio <= cfg["pullback_max_vol_ratio"])
 
     if not (is_breakout or is_pullback):

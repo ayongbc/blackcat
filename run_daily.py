@@ -22,8 +22,14 @@ OUT_DIR = "output"
 DATA_DIR = "data"
 
 CONFIG = {
-    # 基准指数：中证1000
-    "benchmark": "sh.000852",
+    # 基准指数：按 universe 映射到对应板块指数
+    "benchmark": {
+        "hs300": "sh.000300",
+        "zz500": "sh.000905",
+        "sz50": "sh.000016",
+        "zz1000": "sh.000852",
+        "zz2000": "sh.932000",
+    },
 
     # 选股宇宙：all | hs300 | zz500 | sz50 | zz1000 | zz2000（zz1000/zz2000 需 akshare）
     "universe": "zz500",
@@ -243,7 +249,12 @@ def get_stock_list() -> pd.DataFrame:
 
 
 def compute_benchmark_ret20(end_date: str):
-    b = CONFIG["benchmark"]
+    cfg = CONFIG["benchmark"]
+    b = (
+        cfg.get(CONFIG["universe"]) or cfg.get("default") or "sh.000905"
+        if isinstance(cfg, dict)
+        else (str(cfg) if cfg else "sh.000905")
+    )
     df = load_or_update_kline(b, end_date, CONFIG["adjustflag"])
     if df.empty or len(df) < 40:
         return None, None
@@ -296,12 +307,13 @@ def score_one(df: pd.DataFrame, bench_ret20: float):
     vol_ratio = float(d["volume"]) / float(d["vol_ma20"]) if float(d["vol_ma20"]) > 0 else 0
     is_breakout = (close >= float(prev20_max_close)) and (vol_ratio >= CONFIG["breakout_vol_ratio"])
 
-    # pullback setup（回踩时要求缩量确认）
+    # pullback setup：最近 2 天（不含当日）都在 MA20±tol 内触及，且当日缩量，当日收盘 > MA20
     tol = CONFIG["pullback_touch_tol"]
-    recent = df.iloc[-6:-1]  # prev 5 days
+    last_2 = df.iloc[-3:-1]  # 最近 2 个交易日
     touched = (
-        (recent["low"] <= recent["ma20"] * (1 + tol)) & (recent["low"] >= recent["ma20"] * (1 - tol))
-    ).any()
+        (last_2["low"] <= last_2["ma20"] * (1 + tol))
+        & (last_2["low"] >= last_2["ma20"] * (1 - tol))
+    ).all()
     is_pullback = touched and (close > ma20v) and (vol_ratio <= CONFIG["pullback_max_vol_ratio"])
 
     if not (is_breakout or is_pullback):
@@ -464,7 +476,13 @@ def write_reports(end_date: str, df: pd.DataFrame):
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# Daily Pool {end_date}\n\n")
-        f.write(f"- benchmark: {CONFIG['benchmark']}\n")
+        bcfg = CONFIG["benchmark"]
+        bstr = (
+            bcfg.get(CONFIG["universe"]) or bcfg.get("default") or "sh.000905"
+            if isinstance(bcfg, dict)
+            else str(bcfg)
+        )
+        f.write(f"- benchmark: {bstr}\n")
         f.write(f"- universe: {CONFIG['universe']}\n")
         f.write(f"- pool_size: {CONFIG['pool_size']}\n")
         f.write(f"- min_avg_amount_20: {CONFIG['min_avg_amount_20']:.0f}\n")
@@ -516,14 +534,18 @@ def main():
         return (time.time() - start_ts) >= (args.max_minutes * 60)
 
     last_df_all = None
+    first_iter = True
 
     try:
         while True:
+            # --no-resume 只影响第一轮：清掉旧进度从头跑；后续 auto 批次继续用已有进度
+            resume_val = not args.no_resume if first_iter else True
+            first_iter = False
             df_all = run_batch(
                 end_date=end_date,
                 max_symbols=args.max_symbols,
                 batch_size=args.batch_size,
-                resume=not args.no_resume,
+                resume=resume_val,
             )
             last_df_all = df_all
 

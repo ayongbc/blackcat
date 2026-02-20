@@ -133,7 +133,12 @@ def run_backtest(config: dict) -> dict:
     strategy_name = config.get("strategy", "trend_ma")
     strategy_params = config.get("strategy_params", {})
     universe = config.get("universe", "zz500")
-    benchmark = config.get("benchmark", "sh.000852")
+    benchmark_cfg = config.get("benchmark", "sh.000905")
+    benchmark = (
+        benchmark_cfg.get(universe) or benchmark_cfg.get("default") or "sh.000905"
+        if isinstance(benchmark_cfg, dict)
+        else (str(benchmark_cfg) if benchmark_cfg else "sh.000905")
+    )
     start_date = config.get("start_date", "2023-01-01")
     end_date = config.get("end_date", dt.date.today().isoformat())
     end_date = str(end_date).strip() or dt.date.today().isoformat()
@@ -345,6 +350,26 @@ def run_backtest(config: dict) -> dict:
                 })
             else:
                 still_held.append(p)
+        # 最后一天：剩余持仓按当日收盘价强制清仓，计入交易记录
+        if i == len(dates) - 2 and still_held:
+            for p in still_held:
+                close_t = _get_price(price_cache, p["code"], t, "close", get_kline_fn) or p["buy_price"]
+                exited_today.append({
+                    **p,
+                    "sell_date": t,
+                    "exit_reason": "end_close",
+                    "exit_price": close_t,
+                })
+                all_trades.append({
+                    "code": p["code"],
+                    "name": p["name"],
+                    "buy_date": p["buy_date"],
+                    "sell_date": t,
+                    "exit_reason": "end_close",
+                    "entry": p["buy_price"],
+                    "exit_price": close_t,
+                })
+            still_held = []
         positions = still_held
 
         # 退出变现：卖出所得加入现金
@@ -412,7 +437,12 @@ def _write_detailed_report(
     end_date = config.get("end_date", "")
     strategy_name = config.get("strategy", "trend_ma")
     universe = config.get("universe", "zz500")
-    benchmark = config.get("benchmark", "sh.000852")
+    benchmark_cfg = config.get("benchmark", "sh.000905")
+    benchmark = (
+        benchmark_cfg.get(universe) or benchmark_cfg.get("default") or "sh.000905"
+        if isinstance(benchmark_cfg, dict)
+        else (str(benchmark_cfg) if benchmark_cfg else "sh.000905")
+    )
 
     total_ret = result["total_return"]
     annual_ret = result["annual_return"]
