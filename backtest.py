@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import baostock as bs
 
-from data.kline_loader import load_kline
+from data.kline_loader import load_kline, compute_benchmark_ret20
 from data.universe import get_stock_list, get_trading_dates
 from strategies import get_strategy
 
@@ -28,18 +28,6 @@ def _load_config(path: str) -> dict:
         except ImportError:
             raise RuntimeError("YAML 配置需要 PyYAML: pip install pyyaml")
     return {}
-
-
-def _compute_benchmark_ret20(benchmark: str, as_of_date: str, adjustflag: str = "2") -> float | None:
-    df = load_kline(benchmark, as_of_date, lookback_days=60, adjustflag=adjustflag)
-    if df.empty or len(df) < 40:
-        return None
-    df = df.copy()
-    df["ret20"] = df["close"].pct_change(20)
-    last = df.dropna().tail(1)
-    if last.empty:
-        return None
-    return float(last["ret20"].iloc[-1])
 
 
 def _get_price(price_cache: dict, code: str, date: str, field: str, load_fn) -> float | None:
@@ -211,7 +199,7 @@ def run_backtest(config: dict) -> dict:
         t = dates[i]  # 当前日
         day_idx = i - 1
 
-        bench_ret = _compute_benchmark_ret20(benchmark, t_prev, adjustflag)
+        bench_ret = compute_benchmark_ret20(benchmark, t_prev, adjustflag)
         if bench_ret is None:
             daily_returns.append(0.0)
             pool_history.append({"date": t, "pool": [], "ret": 0.0, "trades": []})

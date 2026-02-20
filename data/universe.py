@@ -39,7 +39,7 @@ def get_trading_dates(start_date: str, end_date: str) -> list[str]:
     return df["calendar_date"].astype(str).tolist()
 
 
-def _last_trading_date() -> str:
+def last_trading_date() -> str:
     today = __import__("datetime").date.today().strftime("%Y-%m-%d")
     rs = bs.query_trade_dates(
         start_date=(__import__("datetime").date.today() - __import__("datetime").timedelta(days=30)).strftime("%Y-%m-%d"),
@@ -62,7 +62,7 @@ def get_universe_codes(universe: str, query_date: Optional[str] = None) -> set[s
     - zz1000/zz2000: 使用 AKShare，成分股为当前（历史回测时为近似）
     """
     if query_date is None:
-        query_date = _last_trading_date()
+        query_date = last_trading_date()
 
     if universe == "all":
         return set()

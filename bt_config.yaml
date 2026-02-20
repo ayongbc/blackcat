@@ -1,10 +1,10 @@
 # 回测配置文件
 # 支持通过命令行 --strategy, --start, --end 覆盖
 
-# 选股策略名称（可选：trend_ma 等）
+# 选股策略名称（trend_ma / pullback_ma120）
 strategy: trend_ma
 
-# 策略参数（trend_ma 策略专用）
+# 策略参数（trend_ma 专用；若用 pullback_ma120 可改为：min_bars: 180, min_days_above_ma120: 60, min_ma60_above_ma120_days: 10, pullback_lookback: 10, pullback_touch_tol: 0.02, max_close_over_ma120: 1.05, volume_shrink_ratio: 0.85）
 strategy_params:
   pool_size: 3              # 每日持仓数量（取评分 top N）
   min_avg_amount_20: 50000000  # 20 日均成交额下限（元），过滤流动性不足
@@ -29,8 +29,8 @@ adjustflag: "2"
 allow_bj: false
 
 # 回测起止日期（仅用本地已有 K 线，请先对该区间跑 supplement_kline 补全数据）
-start_date: "2024-01-01"
-end_date: "2024-03-31"  # 回测最后一天（收益统计到这一天）
+start_date: "2025-01-01"
+end_date: "2025-03-31"  # 回测最后一天（收益统计到这一天）
 
 # 选股时间段：只在此区间内每日重新选池，可设短一些以加快回测；不填则与上面起止一致
 pool_screen_start: null  # 选股开始日，null=用 start_date

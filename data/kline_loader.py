@@ -141,6 +141,21 @@ def load_kline(
     return df[df["date"] <= end_date].copy() if len(df) > 0 else df
 
 
+def compute_benchmark_ret20(
+    benchmark: str, as_of_date: str, adjustflag: str = "2"
+) -> float | None:
+    """计算基准指数截至 as_of_date 的 20 日收益率，供 run_daily 与回测共用"""
+    df = load_kline(
+        benchmark, as_of_date, lookback_days=60, adjustflag=adjustflag
+    )
+    if df.empty or len(df) < 40:
+        return None
+    df = df.copy()
+    df["ret20"] = df["close"].pct_change(20)
+    last = df.dropna().tail(1)
+    return float(last["ret20"].iloc[-1]) if not last.empty else None
+
+
 def load_kline_for_backtest(
     code: str,
     as_of_date: str,

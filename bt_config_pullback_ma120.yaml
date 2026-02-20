@@ -1,0 +1,49 @@
+# pullback_ma120 策略专用配置
+# 启动示例：python run_daily.py -c bt_config_pullback_ma120.yaml
+
+strategy: pullback_ma120
+
+# 策略参数（120MA 回踩：股价 > 120MA 60 天，回踩企稳，缩量，60MA > 120MA）
+strategy_params:
+  pool_size: 50              # 每日持仓/输出数量（取评分 top N）
+  min_avg_amount_20: 50000000  # 20 日均成交额下限（元）
+  min_bars: 180              # K 线最少条数（需覆盖 120MA + 缓冲）
+  min_days_above_ma120: 60   # 股价 > 120MA 连续天数
+  min_ma60_above_ma120_days: 30  # 60MA > 120MA 至少维持天数
+  pullback_lookback: 5      # 持续回踩天数：最近 n 天收盘均在 120MA 附近企稳
+  pullback_touch_tol: 0.02   # 回踩区下界：close >= ma120*(1-tol)
+  max_close_over_ma120: 1.05 # 收盘相对 120MA 上限（5%），防追高
+  max_breakdown_below_ma120: 0.03  # 回踩期内最低价不得跌破 120MA 超过 3%，排除破位后反弹
+  min_ma120_rise_60d: 0.03        # 当日 120MA 比 60 天前高至少 3%，确保长均线上升
+  volume_shrink_ratio: 0.85  # 缩量：vol5/vol20 需 <= 此值
+  min_rs20: 0.0              # 相对强度下限（相对基准 20 日收益）
+  pool_workers: 8            # 回测时并行评分进程数，0=不并行
+
+# 选股宇宙（hs300 / zz500 / sz50 / zz1000 / zz2000）
+universe: zz500
+# 基准指数代码（用于计算相对强度）
+benchmark: sh.000852
+# 复权方式：1=后复权, 2=前复权, 3=不复权
+adjustflag: "2"
+# 是否包含北交所
+allow_bj: false
+
+# 回测起止日期
+start_date: "2023-01-01"
+end_date: "2023-06-30"  # 回测最后一天
+pool_screen_start: null  # 选股开始日，null=用 start_date
+pool_screen_end: null    # 选股结束日，null=用 end_date
+
+# 资金与仓位
+initial_capital: 500000  # 初始资金（元）
+max_positions: 5         # 最多持仓只数
+
+# 止盈止损（按当日 high/low 判断）
+stop_loss_pct: -5   # 止损点数，如 -5 表示 -5%
+take_profit_pct: 30 # 止盈点数，如 30 表示 30%
+break_ma20_pct: 2   # 破 MA20 N 个点卖出
+
+# 调仓规则
+exit_by_score_rank: false  # true=积分排序，只保留当日 top N
+hold_days: 3               # 弱势调仓观察期（天）
+hold_strong_pct: 3         # 观察期内未过买入价+此% 则调出
