@@ -11,7 +11,7 @@ from pathlib import Path
 import pandas as pd
 import baostock as bs
 
-from data.kline_loader import load_kline
+from data.kline_loader import load_kline, compute_benchmark_ret20
 from data.universe import get_stock_list, get_trading_dates
 from strategies import get_strategy
 
@@ -28,18 +28,6 @@ def _load_config(path: str) -> dict:
         except ImportError:
             raise RuntimeError("YAML 配置需要 PyYAML: pip install pyyaml")
     return {}
-
-
-def _compute_benchmark_ret20(benchmark: str, as_of_date: str, adjustflag: str = "2") -> float | None:
-    df = load_kline(benchmark, as_of_date, lookback_days=60, adjustflag=adjustflag)
-    if df.empty or len(df) < 40:
-        return None
-    df = df.copy()
-    df["ret20"] = df["close"].pct_change(20)
-    last = df.dropna().tail(1)
-    if last.empty:
-        return None
-    return float(last["ret20"].iloc[-1])
 
 
 def _get_price(price_cache: dict, code: str, date: str, field: str, load_fn) -> float | None:
@@ -169,6 +157,7 @@ def run_backtest(config: dict) -> dict:
     max_positions = int(config.get("max_positions", 5))
     if max_positions < 1:
         max_positions = 1
+    exit_by_score_rank = bool(config.get("exit_by_score_rank", False))
 
     strategy_params["pool_size"] = strategy_params.get("pool_size", pool_size)
     strategy_cls = get_strategy(strategy_name)
@@ -199,7 +188,9 @@ def run_backtest(config: dict) -> dict:
     if hold_days is not None and hold_strong_pct is not None:
         print(f"  弱势调仓: 持有 {hold_days} 日内未过买入价+{config.get('hold_strong_pct')}% 则调出", flush=True)
     print(f"  初始资金: {initial_capital:,.0f} 元，最多持仓: {max_positions} 只", flush=True)
-    print("  规则: T+1（买入日不卖），选股次日开盘买，持有至止盈/止损/破MA20 触发才卖", flush=True)
+    if exit_by_score_rank:
+        print("  调仓: 积分排序（每日只保留当日选股池 score 前 N 名，其余调出）", flush=True)
+    print("  规则: T+1（买入日不卖），选股次日开盘买，持有至止盈/止损/破MA20 或积分调出", flush=True)
     print("  开始循环...", flush=True)
 
     price_cache = {}
@@ -218,7 +209,7 @@ def run_backtest(config: dict) -> dict:
         t = dates[i]  # 当前日
         day_idx = i - 1
 
-        bench_ret = _compute_benchmark_ret20(benchmark, t_prev, adjustflag)
+        bench_ret = compute_benchmark_ret20(benchmark, t_prev, adjustflag)
         if bench_ret is None:
             daily_returns.append(0.0)
             pool_history.append({"date": t, "pool": [], "ret": 0.0, "trades": []})
@@ -266,11 +257,32 @@ def run_backtest(config: dict) -> dict:
         # 2) 检查退出：仅对 buy_date < t 的持仓检查（T+1 买入日不卖），用当日 high/low 判断
         exited_today = []
         still_held = []
+        # 积分排序调仓：当日池子已按 score 排序，只保留在当日 top max_positions 内的持仓
+        top_codes = set(r["code"] for r in pool[:max_positions]) if (exit_by_score_rank and pool) else set()
         for p in positions:
             if p["buy_date"] == t:
                 still_held.append(p)
                 continue
             code, buy_price = p["code"], p["buy_price"]
+            # 积分排序：不在当日 top N 则调出
+            if top_codes and code not in top_codes:
+                exit_p_sr = _get_price(price_cache, code, t, "close", get_kline_fn) or buy_price
+                exited_today.append({
+                    **p,
+                    "sell_date": t,
+                    "exit_reason": "score_rank",
+                    "exit_price": exit_p_sr,
+                })
+                all_trades.append({
+                    "code": p["code"],
+                    "name": p["name"],
+                    "buy_date": p["buy_date"],
+                    "sell_date": t,
+                    "exit_reason": "score_rank",
+                    "entry": p["buy_price"],
+                    "exit_price": exit_p_sr,
+                })
+                continue
             high_t = _get_price(price_cache, code, t, "high", get_kline_fn)
             low_t = _get_price(price_cache, code, t, "low", get_kline_fn)
             if high_t is None or low_t is None:
@@ -500,6 +512,7 @@ def _write_detailed_report(
     target_str = f"止盈 {tp_pct}%" if tp_pct is not None else "不止盈"
     break_str = f"破MA20 {bm_pct}%卖出" if bm_pct is not None else "无"
     weak_str = f"弱势调仓 {hold_days_cfg}日未过+{hold_strong_cfg}%" if hold_days_cfg is not None and hold_strong_cfg is not None else "无"
+    rank_str = "积分排序（只保留当日 score 前 N）" if config.get("exit_by_score_rank") else "无"
     lines = [
         "# 回测详细报告",
         "",
@@ -507,7 +520,7 @@ def _write_detailed_report(
         f"- **宇宙**: {universe}",
         f"- **基准**: {benchmark}",
         f"- **区间**: {start_date} ~ {end_date}",
-        f"- **止盈止损**: {stop_str}, {target_str}, {break_str}, {weak_str}",
+        f"- **止盈止损**: {stop_str}, {target_str}, {break_str}, {weak_str}；**调仓**: {rank_str}",
         f"- **初始资金**: {config.get('initial_capital', 500000):,.0f} 元，**最多持仓**: {config.get('max_positions', 5)} 只",
         "",
         "## 1. 收益与风险汇总",

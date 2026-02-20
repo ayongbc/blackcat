@@ -4,9 +4,11 @@
 """
 
 from .base import BaseStrategy
+from .pullback_ma120 import PullbackMA120Strategy
 from .trend_ma import TrendMAStrategy
 
 STRATEGIES = {
+    "pullback_ma120": PullbackMA120Strategy,
     "trend_ma": TrendMAStrategy,
 }
 

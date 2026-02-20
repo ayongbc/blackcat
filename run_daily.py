@@ -1,35 +1,60 @@
-# run_daily.py
-# A-share daily pool screener (MA + price/volume) using BaoStock + AKShare
+#!/usr/bin/env python3
+"""
+日频选股日报生成器
+调用 strategies 与 data 层，从 bt_config.yaml 读取配置，与回测共用同一套筛选逻辑与参数。
+"""
 
-import os
-import math
-import time
-import json
 import argparse
-import datetime as dt
-from typing import Optional
+import math
+import os
+import time
+from pathlib import Path
 
 import pandas as pd
 import baostock as bs
 
-try:
-    import akshare as ak
-    HAS_AKSHARE = True
-except ImportError:
-    HAS_AKSHARE = False
+from data.kline_loader import load_kline, compute_benchmark_ret20
+from data.universe import get_stock_list, last_trading_date
+from strategies import get_strategy
+
+
+def _load_config(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    if p.suffix in (".yaml", ".yml"):
+        try:
+            import yaml
+            with open(p, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except ImportError:
+            raise RuntimeError("YAML 配置需要 PyYAML: pip install pyyaml")
+    return {}
+
+
+def build_strategy_config(cfg: dict) -> dict:
+    """合并 strategy_params 与顶层配置，供策略使用"""
+    params = cfg.get("strategy_params") or {}
+    benchmark_cfg = cfg.get("benchmark", "sh.000852")
+    universe = cfg.get("universe", "zz500")
+    if isinstance(benchmark_cfg, dict):
+        benchmark = benchmark_cfg.get(universe) or benchmark_cfg.get("default") or "sh.000852"
+    else:
+        benchmark = str(benchmark_cfg) if benchmark_cfg else "sh.000852"
+    return {
+        **params,
+        "benchmark": benchmark,
+        "adjustflag": str(cfg.get("adjustflag", "2")),
+        "allow_bj": cfg.get("allow_bj", False),
+        "universe": universe,
+    }
 
 OUT_DIR = "output"
 DATA_DIR = "data"
 
 CONFIG = {
-    # 基准指数：按 universe 映射到对应板块指数
-    "benchmark": {
-        "hs300": "sh.000300",
-        "zz500": "sh.000905",
-        "sz50": "sh.000016",
-        "zz1000": "sh.000852",
-        "zz2000": "sh.932000",
-    },
+    # 基准指数：中证1000
+    "benchmark": "sh.000852",
 
     # 选股宇宙：all | hs300 | zz500 | sz50 | zz1000 | zz2000（zz1000/zz2000 需 akshare）
     "universe": "zz500",
@@ -168,7 +193,7 @@ def last_trading_date() -> str:
         return today
     return str(df_td.iloc[-1]["calendar_date"])
 
-
+    
 def _akshare_code_to_baostock(s: str) -> str:
     """AKShare/CSI 格式 (600549.SH) -> BaoStock 格式 (sh.600549)"""
     s = str(s).strip().upper()
@@ -249,12 +274,7 @@ def get_stock_list() -> pd.DataFrame:
 
 
 def compute_benchmark_ret20(end_date: str):
-    cfg = CONFIG["benchmark"]
-    b = (
-        cfg.get(CONFIG["universe"]) or cfg.get("default") or "sh.000905"
-        if isinstance(cfg, dict)
-        else (str(cfg) if cfg else "sh.000905")
-    )
+    b = CONFIG["benchmark"]
     df = load_or_update_kline(b, end_date, CONFIG["adjustflag"])
     if df.empty or len(df) < 40:
         return None, None
@@ -307,13 +327,12 @@ def score_one(df: pd.DataFrame, bench_ret20: float):
     vol_ratio = float(d["volume"]) / float(d["vol_ma20"]) if float(d["vol_ma20"]) > 0 else 0
     is_breakout = (close >= float(prev20_max_close)) and (vol_ratio >= CONFIG["breakout_vol_ratio"])
 
-    # pullback setup：最近 2 天（不含当日）都在 MA20±tol 内触及，且当日缩量，当日收盘 > MA20
+    # pullback setup（回踩时要求缩量确认）
     tol = CONFIG["pullback_touch_tol"]
-    last_2 = df.iloc[-3:-1]  # 最近 2 个交易日
+    recent = df.iloc[-6:-1]  # prev 5 days
     touched = (
-        (last_2["low"] <= last_2["ma20"] * (1 + tol))
-        & (last_2["low"] >= last_2["ma20"] * (1 - tol))
-    ).all()
+        (recent["low"] <= recent["ma20"] * (1 + tol)) & (recent["low"] >= recent["ma20"] * (1 - tol))
+    ).any()
     is_pullback = touched and (close > ma20v) and (vol_ratio <= CONFIG["pullback_max_vol_ratio"])
 
     if not (is_breakout or is_pullback):
@@ -336,162 +355,111 @@ def score_one(df: pd.DataFrame, bench_ret20: float):
     )
 
     setup = ("breakout" if is_breakout else "") + ("+pullback" if (is_breakout and is_pullback) else ("pullback" if is_pullback else ""))
-
+    code = str(df["code"].iloc[-1]) if "code" in df.columns else ""
     return {
-        "close": close,
-        "vol_ratio": round(vol_ratio, 2),
-        "avg_amt20": float(d["avg_amt20"]),
-        "rs20": rs20,
-        "trend_open": trend_open,
-        "atrp": risk,
-        "score": score,
+        "code": code,
+        "name": "",
         "setup": setup,
+        "score": score,
+        "rs20": rs20,
+        "vol_ratio": vol_ratio,
+        "atrp": risk,
+        "avg_amt20": float(d["avg_amt20"]),
+        "close": close,
     }
 
 
-def load_state(path: str) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+def run_screen(config: dict, end_date: str, max_symbols: int | None) -> list[dict]:
+    """执行选股，返回候选池 list[dict]"""
+    strategy_name = config.get("strategy", "trend_ma")
+    StrategyClass = get_strategy(strategy_name)
+    strategy_config = build_strategy_config(config)
+    strategy = StrategyClass(config=strategy_config)
 
+    universe_df = get_stock_list(
+        universe=config.get("universe", "zz500"),
+        query_date=end_date,
+        allow_bj=config.get("allow_bj", False),
+    )
+    if isinstance(max_symbols, int) and max_symbols > 0:
+        universe_df = universe_df.head(max_symbols)
 
-def save_state(path: str, state: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-def run_batch(end_date: str, max_symbols: Optional[int], batch_size: int, resume: bool) -> pd.DataFrame:
-    bench_ret20, _ = compute_benchmark_ret20(end_date)
+    benchmark_cfg = config.get("benchmark", "sh.000905")
+    universe = config.get("universe", "zz500")
+    if isinstance(benchmark_cfg, dict):
+        benchmark = benchmark_cfg.get(universe) or benchmark_cfg.get("default") or "sh.000905"
+    else:
+        benchmark = str(benchmark_cfg) if benchmark_cfg else "sh.000905"
+    adjustflag = config.get("adjustflag", "2")
+    bench_ret20 = compute_benchmark_ret20(benchmark, end_date, adjustflag)
     if bench_ret20 is None:
         raise RuntimeError("基准指数数据不足，检查 benchmark 代码/数据是否成功拉取")
 
-    uni = get_stock_list()
-    if isinstance(max_symbols, int) and max_symbols > 0:
-        uni = uni.head(max_symbols)
+    lookback_days = strategy_config.get("lookback_days", 500)
+    min_bars = strategy_config.get("min_bars", 160)
+    lookback_days = max(lookback_days, min_bars + 100)
 
-    total = len(uni)
+    def get_kline_fn(code: str, date: str):
+        return load_kline(code, date, lookback_days=lookback_days, adjustflag=adjustflag)
 
-    state_path = os.path.join(DATA_DIR, "state.json")
-    partial_path = os.path.join(DATA_DIR, f"partial_{end_date}.csv")
+    print(
+        f"Universe={config.get('universe')} size={len(universe_df)} | "
+        f"date={end_date} | benchmark_ret20={bench_ret20:.4f}",
+        flush=True,
+    )
 
-    if not resume:
-        next_idx = 0
-        if os.path.exists(partial_path):
-            os.remove(partial_path)
-    else:
-        st = load_state(state_path)
-        if st.get("date") != end_date:
-            next_idx = 0
-            if os.path.exists(partial_path):
-                os.remove(partial_path)
-        else:
-            next_idx = int(st.get("next_idx", 0))
-
-    if next_idx >= total:
-        next_idx = 0
-        # 避免再次续跑时往旧 partial 上追加导致同一 code 重复
-        if os.path.exists(partial_path):
-            os.remove(partial_path)
-
-    end_idx = min(total, next_idx + batch_size)
-    chunk = uni.iloc[next_idx:end_idx]
-
-    print(f"Universe={CONFIG['universe']} size={total} | batch {next_idx}->{end_idx} | benchmark_ret20={bench_ret20:.4f}", flush=True)
-
-    rows = []
-    t0 = time.time()
-
-    for j, r in enumerate(chunk.itertuples(index=False), start=1):
-        code, name = r.code, r.code_name
-        if j == 1 or j % 10 == 0:
-            print(f"  [{j}/{len(chunk)}] {code} ... elapsed={time.time() - t0:.1f}s", flush=True)
-
-        df = load_or_update_kline(code, end_date, CONFIG["adjustflag"])
-        if df.empty or len(df) < CONFIG["min_bars"]:
-            continue
-
-        scored = score_one(df, bench_ret20)
-        if not scored:
-            continue
-
-        rows.append(
-            {
-                "date": end_date,
-                "code": code,
-                "name": name,
-                **scored,
-            }
-        )
-
-    out = pd.DataFrame(rows)
-
-    # append partial
-    if len(out):
-        header = not os.path.exists(partial_path)
-        out.to_csv(partial_path, mode="a", index=False, header=header)
-
-    # update state
-    save_state(state_path, {"date": end_date, "next_idx": end_idx, "total": total, "universe": CONFIG["universe"]})
-
-    # if finished all, build final pool from partial
-    if end_idx >= total:
-        if os.path.exists(partial_path):
-            all_df = pd.read_csv(partial_path)
-            if "code" in all_df.columns:
-                all_df["code"] = all_df["code"].astype(str).str.strip()
-            all_df = (
-                all_df.sort_values("score", ascending=False)
-                .drop_duplicates(subset=["code"], keep="first")
-                .reset_index(drop=True)
-            )
-            min_score = CONFIG.get("min_score")
-            if min_score is not None and min_score > 0:
-                all_df = all_df[all_df["score"] >= min_score].reset_index(drop=True)
-        else:
-            all_df = pd.DataFrame()
-        # reset for next run
-        save_state(state_path, {"date": end_date, "next_idx": total, "total": total, "universe": CONFIG["universe"], "done": True})
-        return all_df
-
-    return pd.DataFrame()  # not finished yet
+    rows = strategy.screen(
+        date=end_date,
+        universe_df=universe_df,
+        get_kline_fn=get_kline_fn,
+        benchmark_ret20=bench_ret20,
+    )
+    return rows
 
 
-def write_reports(end_date: str, df: pd.DataFrame):
-    universe = CONFIG["universe"]
+def write_reports(end_date: str, rows: list[dict], config: dict) -> None:
+    """将选股结果写入 CSV 与 Markdown 报表"""
+    universe = config.get("universe", "zz500")
+    strategy_params = config.get("strategy_params") or {}
+    pool_size = strategy_params.get("pool_size", 50)
     csv_path = os.path.join(OUT_DIR, f"{end_date}_{universe}_pool.csv")
     md_path = os.path.join(OUT_DIR, f"{end_date}_{universe}_report.md")
 
-    if df is None or df.empty:
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    if not rows:
         pool = pd.DataFrame()
     else:
-        # 去重：同一股票可能在断点续跑/重复批次里出现多次，保留最高分那条
-        df2 = df.sort_values("score", ascending=False).drop_duplicates(subset=["code"], keep="first")
-        pool = df2.head(CONFIG["pool_size"]).reset_index(drop=True)
+        df = pd.DataFrame(rows)
+        df = df.sort_values("score", ascending=False).drop_duplicates(
+            subset=["code"], keep="first"
+        )
+        pool = df.head(pool_size).reset_index(drop=True)
 
     pool.to_csv(csv_path, index=False)
 
+    bc = config.get("benchmark")
+    benchmark_str = (
+        (bc.get(universe) or bc.get("default") or "sh.000905") if isinstance(bc, dict)
+        else (str(bc) if bc else "sh.000905")
+    )
+    min_amt = strategy_params.get("min_avg_amount_20", 5e7)
+    min_days_ma120 = strategy_params.get("min_days_above_ma120", "-")
+    min_score = strategy_params.get("min_score", "-")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# Daily Pool {end_date}\n\n")
-        bcfg = CONFIG["benchmark"]
-        bstr = (
-            bcfg.get(CONFIG["universe"]) or bcfg.get("default") or "sh.000905"
-            if isinstance(bcfg, dict)
-            else str(bcfg)
-        )
-        f.write(f"- benchmark: {bstr}\n")
-        f.write(f"- universe: {CONFIG['universe']}\n")
-        f.write(f"- pool_size: {CONFIG['pool_size']}\n")
-        f.write(f"- min_avg_amount_20: {CONFIG['min_avg_amount_20']:.0f}\n")
-        f.write(f"- min_days_above_ma120: {CONFIG.get('min_days_above_ma120', '-')}\n")
-        f.write(f"- min_score: {CONFIG.get('min_score', '-')}\n\n")
+        f.write(f"- benchmark: {benchmark_str}\n")
+        f.write(f"- universe: {universe}\n")
+        f.write(f"- pool_size: {pool_size}\n")
+        f.write(f"- min_avg_amount_20: {min_amt:.0f}\n")
+        f.write(f"- min_days_above_ma120: {min_days_ma120}\n")
+        f.write(f"- min_score: {min_score}\n\n")
         if pool.empty:
-            f.write("No candidates yet (or still running batches).\n")
+            f.write("No candidates.\n")
         else:
-            f.write(pool[["code", "name", "setup", "score", "rs20", "vol_ratio", "atrp", "avg_amt20", "close"]].to_markdown(index=False))
+            cols = ["code", "name", "setup", "score", "rs20", "vol_ratio", "atrp", "avg_amt20", "close"]
+            available = [c for c in cols if c in pool.columns]
+            f.write(pool[available].to_markdown(index=False))
             f.write("\n")
 
     print("Saved:", csv_path, flush=True)
@@ -499,78 +467,38 @@ def write_reports(end_date: str, df: pd.DataFrame):
 
 
 def parse_args():
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="日频选股日报，从 bt_config.yaml 读取配置")
+    p.add_argument("--config", "-c", default="bt_config.yaml", help="配置文件路径")
+    p.add_argument("--date", default=None, help="选股日期 YYYY-MM-DD，默认最近交易日")
     p.add_argument("--universe", default=None, choices=["all", "hs300", "zz500", "sz50", "zz1000", "zz2000"])
-    p.add_argument("--pool-size", type=int, default=None)
-    p.add_argument("--max-symbols", type=int, default=None, help="limit universe size for debug")
-    p.add_argument("--batch-size", type=int, default=80, help="process how many symbols per run")
-    p.add_argument("--no-resume", action="store_true", help="do not resume; start from scratch")
-    p.add_argument("--auto", action="store_true", help="auto-run batches until complete")
-    p.add_argument("--auto-sleep", type=float, default=0.5, help="sleep seconds between auto batches")
-    p.add_argument("--max-minutes", type=float, default=0, help="stop auto mode after N minutes (0=unlimited)")
+    p.add_argument("--pool-size", type=int, default=None, help="覆盖 config 中的 pool_size")
+    p.add_argument("--max-symbols", type=int, default=None, help="调试用：限制宇宙大小")
     return p.parse_args()
 
 
 def main():
-    ensure_dirs()
     args = parse_args()
+    root = Path(__file__).resolve().parent
+    config_path = root / args.config if not Path(args.config).is_absolute() else Path(args.config)
+    config = _load_config(str(config_path))
 
-    if args.universe:
-        CONFIG["universe"] = args.universe
-    if args.pool_size:
-        CONFIG["pool_size"] = args.pool_size
+    if args.universe is not None:
+        config["universe"] = args.universe
+    if args.pool_size is not None:
+        if "strategy_params" not in config:
+            config["strategy_params"] = {}
+        config["strategy_params"]["pool_size"] = args.pool_size
 
     lg = bs.login()
     if lg.error_code != "0":
         raise RuntimeError("BaoStock 登录失败：" + lg.error_msg)
 
-    end_date = dt.date.today().isoformat()
-
-    start_ts = time.time()
-
-    def time_exceeded() -> bool:
-        if not args.max_minutes or args.max_minutes <= 0:
-            return False
-        return (time.time() - start_ts) >= (args.max_minutes * 60)
-
-    last_df_all = None
-    first_iter = True
-
     try:
-        while True:
-            # --no-resume 只影响第一轮：清掉旧进度从头跑；后续 auto 批次继续用已有进度
-            resume_val = not args.no_resume if first_iter else True
-            first_iter = False
-            df_all = run_batch(
-                end_date=end_date,
-                max_symbols=args.max_symbols,
-                batch_size=args.batch_size,
-                resume=resume_val,
-            )
-            last_df_all = df_all
-
-            # 完成整轮
-            if df_all is not None and not df_all.empty:
-                write_reports(end_date, df_all)
-                break
-
-            # 未完成：写进度报表
-            write_reports(end_date, pd.DataFrame())
-
-            if not args.auto:
-                print("Batch finished but not complete. Re-run the script to continue...", flush=True)
-                break
-
-            if time_exceeded():
-                print("Auto mode stopped: max-minutes reached.", flush=True)
-                break
-
-            time.sleep(float(args.auto_sleep))
-
+        end_date = args.date or last_trading_date()
+        rows = run_screen(config, end_date, args.max_symbols)
+        write_reports(end_date, rows, config)
     finally:
         bs.logout()
-
-    # if auto stopped without completion, keep latest progress report already written
 
 
 if __name__ == "__main__":

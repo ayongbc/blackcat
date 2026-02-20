@@ -92,12 +92,14 @@ def main():
 
     # 2. 选股
     if steps_ok and not args.skip_daily:
-        if not run_step(
-            "选股",
-            [python, str(root / "run_daily.py"), "--universe", universe, "--auto"],
-            retries=args.retries,
-            retry_delay=args.retry_delay,
-        ):
+        cmd_daily = [
+            python, str(root / "run_daily.py"),
+            "--config", str(root / args.config),
+            "--date", end_date,
+        ]
+        if universe:
+            cmd_daily.extend(["--universe", universe])
+        if not run_step("选股", cmd_daily, retries=args.retries, retry_delay=args.retry_delay):
             steps_ok = False
             print("流水线在「选股」步骤失败，已停止。", flush=True)
             return 1
