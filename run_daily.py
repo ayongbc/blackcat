@@ -178,22 +178,6 @@ def load_or_update_kline(code: str, end_date: str, adjustflag: str) -> pd.DataFr
     return df
 
 
-def last_trading_date() -> str:
-    today = dt.date.today().strftime("%Y-%m-%d")
-    rs = bs.query_trade_dates(
-        start_date=(dt.date.today() - dt.timedelta(days=30)).strftime("%Y-%m-%d"),
-        end_date=today,
-    )
-    tds = []
-    while (rs.error_code == "0") and rs.next():
-        tds.append(rs.get_row_data())
-    df_td = pd.DataFrame(tds, columns=rs.fields)
-    df_td = df_td[df_td["is_trading_day"] == "1"]
-    if df_td.empty:
-        return today
-    return str(df_td.iloc[-1]["calendar_date"])
-
-    
 def _akshare_code_to_baostock(s: str) -> str:
     """AKShare/CSI 格式 (600549.SH) -> BaoStock 格式 (sh.600549)"""
     s = str(s).strip().upper()
@@ -207,80 +191,6 @@ def _akshare_code_to_baostock(s: str) -> str:
     if s.startswith("6"):
         return "sh." + s
     return "sz." + s
-
-
-def get_universe_codes() -> set[str]:
-    u = CONFIG.get("universe", "all")
-    if u == "all":
-        return set()  # empty => no filter
-
-    # zz1000 / zz2000 用 AKShare（BaoStock 无成分股接口）
-    if u in ("zz1000", "zz2000"):
-        if not HAS_AKSHARE:
-            raise RuntimeError(f"universe={u} 需安装 akshare: pip install akshare")
-        symbol = "000852" if u == "zz1000" else "932000"
-        try:
-            df = ak.index_stock_cons_weight_csindex(symbol=symbol)
-        except Exception as e:
-            raise RuntimeError(f"AKShare 拉取 {u} 成分股失败: {e}") from e
-        # 成分券代码列名可能是 成分券代码 / con_code / code
-        col = None
-        for c in ("成分券代码", "con_code", "code"):
-            if c in df.columns:
-                col = c
-                break
-        if col is None:
-            raise RuntimeError(f"AKShare 返回列中未找到成分股代码，列: {list(df.columns)}")
-        codes = {_akshare_code_to_baostock(x) for x in df[col].dropna().astype(str)}
-        return codes
-
-    query_date = last_trading_date()
-    if u == "hs300":
-        rs = bs.query_hs300_stocks(date=query_date)
-    elif u == "zz500":
-        rs = bs.query_zz500_stocks(date=query_date)
-    elif u == "sz50":
-        rs = bs.query_sz50_stocks(date=query_date)
-    else:
-        raise ValueError(f"Unknown universe: {u}")
-
-    codes = set()
-    while (rs.error_code == "0") and rs.next():
-        codes.add(rs.get_row_data()[1])  # fields usually: date,code
-    return codes
-
-
-def get_stock_list() -> pd.DataFrame:
-    allowed = get_universe_codes()
-
-    rs = bs.query_stock_basic()
-    data = []
-    while (rs.error_code == "0") and rs.next():
-        data.append(rs.get_row_data())
-    df = pd.DataFrame(data, columns=rs.fields)
-
-    if allowed:
-        df = df[df["code"].isin(allowed)].copy()
-
-    # 过滤退市/风险警示（简单版：名称含 ST / 退）
-    df = df[df["status"] == "1"].copy()
-    df = df[~df["code_name"].str.contains("ST", na=False)]
-    df = df[~df["code_name"].str.contains("退", na=False)]
-
-    if not CONFIG["allow_bj"]:
-        df = df[~df["code"].str.startswith("bj.")]
-
-    return df[["code", "code_name", "ipoDate"]].reset_index(drop=True)
-
-
-def compute_benchmark_ret20(end_date: str):
-    b = CONFIG["benchmark"]
-    df = load_or_update_kline(b, end_date, CONFIG["adjustflag"])
-    if df.empty or len(df) < 40:
-        return None, None
-    df["ret20"] = df["close"].pct_change(20)
-    last = df.dropna().iloc[-1]
-    return float(last["ret20"]), df
 
 
 def score_one(df: pd.DataFrame, bench_ret20: float):
@@ -418,12 +328,13 @@ def run_screen(config: dict, end_date: str, max_symbols: int | None) -> list[dic
 
 
 def write_reports(end_date: str, rows: list[dict], config: dict) -> None:
-    """将选股结果写入 CSV 与 Markdown 报表"""
+    """将选股结果写入 CSV 与 Markdown 报表，文件名含策略 id 避免不同策略覆盖"""
     universe = config.get("universe", "zz500")
+    strategy = config.get("strategy", "trend_ma")
     strategy_params = config.get("strategy_params") or {}
     pool_size = strategy_params.get("pool_size", 50)
-    csv_path = os.path.join(OUT_DIR, f"{end_date}_{universe}_pool.csv")
-    md_path = os.path.join(OUT_DIR, f"{end_date}_{universe}_report.md")
+    csv_path = os.path.join(OUT_DIR, f"{end_date}_{universe}_{strategy}_pool.csv")
+    md_path = os.path.join(OUT_DIR, f"{end_date}_{universe}_{strategy}_report.md")
 
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -448,6 +359,7 @@ def write_reports(end_date: str, rows: list[dict], config: dict) -> None:
     min_score = strategy_params.get("min_score", "-")
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# Daily Pool {end_date}\n\n")
+        f.write(f"- strategy: {strategy}\n")
         f.write(f"- benchmark: {benchmark_str}\n")
         f.write(f"- universe: {universe}\n")
         f.write(f"- pool_size: {pool_size}\n")

@@ -121,9 +121,11 @@ def get_stock_list(
     if allowed:
         df = df[df["code"].isin(allowed)].copy()
 
-    df = df[df["status"] == "1"].copy()
-    df = df[~df["code_name"].str.contains("ST", na=False)]
-    df = df[~df["code_name"].str.contains("退", na=False)]
+    if "status" in df.columns:
+        df = df[df["status"] == "1"].copy()
+    if "code_name" in df.columns:
+        df = df[~df["code_name"].str.contains("ST", na=False)]
+        df = df[~df["code_name"].str.contains("退", na=False)]
 
     if not allow_bj:
         df = df[~df["code"].str.startswith("bj.")]
@@ -134,4 +136,5 @@ def get_stock_list(
         as_dt = pd.to_datetime(as_of_date)
         df = df[(df["ipoDate"].isna()) | (df["ipoDate"] <= as_dt)].copy()
 
-    return df[["code", "code_name", "ipoDate"]].reset_index(drop=True)
+    out_cols = [c for c in ["code", "code_name", "ipoDate"] if c in df.columns]
+    return df[out_cols].reset_index(drop=True)

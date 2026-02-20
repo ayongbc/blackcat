@@ -35,8 +35,8 @@ adjustflag: "2"
 allow_bj: false
 
 # 回测起止日期（仅用本地已有 K 线，请先对该区间跑 supplement_kline 补全数据）
-start_date: "2025-01-01"
-end_date: "2025-03-31"  # 回测最后一天（收益统计到这一天）
+start_date: "2023-01-01"
+end_date: "2023-08-31"  # 回测最后一天（收益统计到这一天）
 
 # 选股时间段：只在此区间内每日重新选池，可设短一些以加快回测；不填则与上面起止一致
 pool_screen_start: null  # 选股开始日，null=用 start_date

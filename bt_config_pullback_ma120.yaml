@@ -30,7 +30,7 @@ allow_bj: false
 
 # 回测起止日期
 start_date: "2023-01-01"
-end_date: "2023-06-30"  # 回测最后一天
+end_date: "2023-08-31"  # 回测最后一天（收益统计到这一天）
 pool_screen_start: null  # 选股开始日，null=用 start_date
 pool_screen_end: null    # 选股结束日，null=用 end_date
 

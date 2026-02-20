@@ -19,7 +19,7 @@ DEFAULT_CONFIG = {
     "min_days_above_ma120": 60,
     "min_ma60_above_ma120_days": 10,
     "pullback_lookback": 10,
-    "pullback_touch_tol": 0.02,
+    "pullback_touch_tol": 0.01,
     "max_close_over_ma120": 1.05,
     "max_breakdown_below_ma120": 0.03,  # 回踩期内最低价不得跌破 120MA 超过此比例，排除破位后反弹
     "min_ma120_rise_60d": 0.03,  # 当日 120MA 比 60 天前高至少此比例（如 3%），确保长均线上升
