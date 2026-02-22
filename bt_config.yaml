@@ -20,7 +20,7 @@ strategy_params:
   pool_workers: 4            # 回测时并行评分进程数，0=不并行
 
 # 选股宇宙（hs300 / zz500 / sz50 / zz1000 / zz2000）
-universe: hs300
+universe: zz1000
 # 基准指数代码（用于计算相对强度）：按 universe 指定对应板块指数
 # 也可写为字符串，则所有宇宙共用该基准
 benchmark:
