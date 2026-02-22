@@ -21,8 +21,13 @@ strategy_params:
 
 # 选股宇宙（hs300 / zz500 / sz50 / zz1000 / zz2000）
 universe: zz500
-# 基准指数代码（用于计算相对强度）
-benchmark: sh.000852
+# 基准指数代码（用于计算相对强度）：按 universe 取对应指数，与宇宙一致则填同一指数
+benchmark:
+  hs300: sh.000300
+  zz500: sh.000905   # 与 universe: zz500 一致
+  sz50: sh.000016
+  zz1000: sh.000852
+  zz2000: sh.932000
 # 复权方式：1=后复权, 2=前复权, 3=不复权
 adjustflag: "2"
 # 是否包含北交所
