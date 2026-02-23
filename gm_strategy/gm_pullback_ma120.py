@@ -9,6 +9,7 @@ Token：将 your_token_here 改为你的 token，或设置环境变量 GM_TOKEN�
 """
 
 import os
+from collections import Counter
 from typing import Any
 
 import pandas as pd
@@ -17,7 +18,6 @@ import pandas as pd
 try:
     from gm.api import (
         ADJUST_PREV,
-        get_history_constituents,
         get_previous_trading_date,
         get_trading_dates,
         history,
@@ -33,8 +33,20 @@ try:
         OrderSide_Buy,
         OrderSide_Sell,
     )
+    try:
+        from gm.api import stk_get_index_constituents
+    except ImportError:
+        stk_get_index_constituents = None
+    try:
+        from gm.api import get_constituents
+    except ImportError:
+        get_constituents = None
 except ImportError:
     raise ImportError("请安装掘金 SDK: pip install gm")
+try:
+    from gm.api import ADJUST_NONE
+except ImportError:
+    ADJUST_NONE = 0  # 不复权
 try:
     from gm.api import log as _gm_log
 except Exception:
@@ -53,6 +65,9 @@ def _log(msg: str) -> None:
 GM_TOKEN = os.environ.get("GM_TOKEN", "your_token_here")
 EXCHANGE = "SHSE"  # 用于 get_previous_trading_date 等
 
+# 选股调试：True 时输出每个过滤条件的统计，便于排查“选不出股”
+DEBUG_SELECTION = True
+
 # ---------- 配置（与 bt_config_pullback_ma120.yaml 对齐）----------
 DEFAULT_CONFIG = {
     "min_bars": 180,
@@ -60,24 +75,24 @@ DEFAULT_CONFIG = {
     "min_days_above_ma120": 60,
     "min_ma60_above_ma120_days": 30,
     "pullback_lookback": 5,
-    "pullback_touch_tol": 0.02,
-    "max_close_over_ma120": 1.05,
-    "max_breakdown_below_ma120": 0.03,
+    "pullback_low_min_ma120": 0.98,   # 最近 N 天最低价 >= MA120 * 此值（回踩不破线）
+    "pullback_low_max_ma120": 1.02,   # 最近 N 天收盘价 > MA120 * 此值（收盘在线上方）
     "min_ma120_rise_60d": 0.03,
     "volume_shrink_ratio": 0.85,
     "min_rs20": 0.0,
     "pool_size": 50,
-    "universe_index": "SHSE.000905",   # 中证500（选股宇宙）
-    "benchmark_symbol": "SHSE.000905",  # 与宇宙一致，用于相对强度
-    "max_positions": 5,
+    "universe_index": "SHSE.000300",   # 中证500（选股宇宙）
+    "benchmark_symbol": "SHSE.000300",  # 与宇宙一致，用于相对强度
+    "max_positions": 3,
     "initial_capital": 500000,
     "stop_loss_pct": -0.05,
     "take_profit_pct": 0.30,
-    "break_ma20_pct": 0.02,
-    "hold_days": 3,
-    "hold_strong_pct": 0.03,
-    "backtest_start": "2023-01-01",
-    "backtest_end": "2023-08-31",
+    "drawdown_from_high_pct": 0.10,   # 买入后高点回撤 10% 卖出
+    "drawdown_min_rise_pct": 0.05,    # 仅当买入后曾涨过至少 5% 才启用回撤卖出，避免刚买没涨就误触
+    "backtest_start": "2023-09-02",
+    "backtest_end": "2023-12-19",
+    "backtest_adjust": 1,   # 回测成交价/持仓成本：1=前复权(ADJUST_PREV)，0=不复权(ADJUST_NONE)。应与选股、卖出用同一复权
+    "sell_bars_adjust": 1, # 卖出判断用K线：1=前复权，0=不复权。建议与 backtest_adjust 一致
 }
 
 
@@ -116,21 +131,78 @@ def _trading_dates_between(exchange: str, start_date: str, end_date: str) -> lis
     return result
 
 
-def get_gm_constituents(index_symbol: str, date: str, df: bool = True):
-    """当日指数成分股。掘金: get_history_constituents(index, start_date, end_date, df=True)。"""
-    try:
-        ret = get_history_constituents(
-            index=index_symbol,
-            start_date=date,
-            end_date=date,
-            df=df,
-        )
-        if df and ret is not None and not ret.empty and "symbol" in ret.columns:
-            return ret["symbol"].tolist()
-        if not df and ret:
-            return [r.get("symbol") for r in ret if r.get("symbol")]
+def _parse_constituents_ret(ret, index_symbol: str, date: str):
+    """从 API 返回值解析出 symbol 列表。支持 DataFrame 或 list of dict，列名 symbol/sec_id/code。"""
+    if ret is None:
+        return None
+    # DataFrame
+    if hasattr(ret, "columns") and hasattr(ret, "empty"):
+        if ret.empty:
+            return []
+        for col in ("symbol", "sec_id", "code"):
+            if col in ret.columns:
+                syms = ret[col].dropna().astype(str).tolist()
+                return syms
+        if DEBUG_SELECTION:
+            _log(f"[选股] 指数 {index_symbol} 日期 {date} 返回 DataFrame 但无 symbol 列，列名: {list(ret.columns)}")
         return []
-    except Exception:
+    # list of dict
+    if isinstance(ret, (list, tuple)):
+        syms = []
+        for r in ret:
+            if not isinstance(r, dict):
+                continue
+            for key in ("symbol", "sec_id", "code"):
+                if r.get(key):
+                    syms.append(str(r[key]))
+                    break
+        return syms
+    return None
+
+
+def get_gm_constituents(index_symbol: str, date: str, df: bool = True):
+    """当日指数成分股。优先用 stk_get_index_constituents / get_constituents（最新成分股），否则用 get_history_constituents（历史）。"""
+    used_latest = False
+    try:
+        ret = None
+        # 1) 新版：仅 index 参数，返回最新交易日成分股（回测时用“最新”近似当日）
+        if stk_get_index_constituents is not None:
+            try:
+                ret = stk_get_index_constituents(index=index_symbol)
+                used_latest = True
+            except Exception:
+                ret = None
+        if (ret is None or (hasattr(ret, "empty") and ret.empty)) and get_constituents is not None:
+            try:
+                ret = get_constituents(index_symbol)
+                used_latest = True
+            except Exception:
+                ret = None
+        # 2) 旧版历史成分股（已弃用且可能返回空）
+        if ret is None or (hasattr(ret, "empty") and ret.empty):
+            from gm.api import get_history_constituents
+            ret = get_history_constituents(
+                index=index_symbol,
+                start_date=date,
+                end_date=date,
+            )
+            used_latest = False
+
+        syms = _parse_constituents_ret(ret, index_symbol, date)
+        if syms is None:
+            if DEBUG_SELECTION:
+                _log(f"[选股] 指数 {index_symbol} 日期 {date} 成分股为空 (ret=None)")
+            return []
+        if used_latest and DEBUG_SELECTION and len(syms) > 0:
+            _log(f"[选股] 指数 {index_symbol} 使用「最新成分股」近似日期 {date}（共 {len(syms)} 只）")
+        if DEBUG_SELECTION and len(syms) > 0:
+            _log(f"[选股] 指数 {index_symbol} 日期 {date} 成分股数量: {len(syms)} 只")
+        if len(syms) == 0 and DEBUG_SELECTION:
+            _log(f"[选股] 指数 {index_symbol} 日期 {date} 成分股为空 (ret type={type(ret).__name__})")
+        return syms
+    except Exception as e:
+        if DEBUG_SELECTION:
+            _log(f"[选股] 获取成分股异常 index={index_symbol} date={date}: {e}")
         return []
 
 
@@ -182,15 +254,15 @@ def score_one_gm(
     df_bar: pd.DataFrame,
     bench_ret20: float,
     config: dict,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, str | None]:
     """
     与 strategies/pullback_ma120._score_one 逻辑一致。
-    df_bar 需含列: open, high, low, close, volume, amount, date（或 eob 转成的 date）, code.
+    返回 (结果字典, None) 或 (None, 失败原因)，便于统计选股过滤原因。
     """
     cfg = config
     min_bars = cfg.get("min_bars", 180)
     if df_bar is None or len(df_bar) < min_bars:
-        return None
+        return None, f"K线不足(min_bars={min_bars}, 实际={len(df_bar) if df_bar is not None else 0})"
     df = df_bar.copy()
     df["ma60"] = _ma(df["close"], 60)
     df["ma120"] = _ma(df["close"], 120)
@@ -201,50 +273,44 @@ def score_one_gm(
     df["ret20"] = df["close"].pct_change(20)
     d = df.dropna().iloc[-1]
     if float(d["avg_amt20"]) < cfg["min_avg_amount_20"]:
-        return None
+        return None, f"20日均额不足(需>={cfg['min_avg_amount_20']/1e7:.0f}百万, 实际={float(d['avg_amt20'])/1e7:.1f})"
     n_above = cfg["min_days_above_ma120"]
     lookback = cfg["pullback_lookback"]
     if n_above > lookback:
         before_pullback = df.iloc[-n_above:-lookback]
         if len(before_pullback) > 0 and not (before_pullback["close"] > before_pullback["ma120"]).all():
-            return None
+            return None, "回踩前未持续在120线上方"
     n_ma_trend = cfg["min_ma60_above_ma120_days"]
     recent_ma = df.iloc[-n_ma_trend:]
     if not (recent_ma["ma60"] > recent_ma["ma120"]).all():
-        return None
+        return None, "近期ma60未持续>ma120"
     if len(df) >= 61:
         ma120_today = float(d["ma120"])
         ma120_60d_ago = float(df["ma120"].iloc[-61])
         if ma120_60d_ago <= 0:
-            return None
+            return None, "60日前ma120无效"
         min_rise = cfg.get("min_ma120_rise_60d", 0.03)
         if ma120_today < ma120_60d_ago * (1 + min_rise):
-            return None
+            return None, f"120线60日涨幅不足(需>={min_rise*100:.0f}%)"
     lookback = cfg["pullback_lookback"]
-    tol = cfg["pullback_touch_tol"]
-    max_over = cfg["max_close_over_ma120"]
-    max_breakdown = cfg.get("max_breakdown_below_ma120", 0.03)
+    low_min = cfg.get("pullback_low_min_ma120", 0.98)
+    low_max = cfg.get("pullback_low_max_ma120", 1.02)
     recent = df.iloc[-lookback:]
-    in_pullback_zone = (
-        (recent["close"] >= recent["ma120"] * (1 - tol))
-        & (recent["close"] <= recent["ma120"] * max_over)
-    )
-    if not in_pullback_zone.all():
-        return None
-    if (recent["low"] < recent["ma120"] * (1 - max_breakdown)).any():
-        return None
+    # 回踩120：最近 N 天 最低价 >= MA120*low_min，且 收盘价 > MA120*low_max    
+    low_ok = recent["low"] <= recent["ma120"] * low_max
+    close_ok = recent["close"] >= recent["ma120"] * low_min
+    if not (low_ok & close_ok).all():
+        return None, f"近{lookback}日未同时满足: 最低价>={low_min}*MA120 且 收盘>{low_max}*MA120"
     close = float(d["close"])
     ma120v = float(d["ma120"])
-    if close <= ma120v * (1 - tol) or close / ma120v > max_over:
-        return None
     vol5 = float(d["vol_ma5"]) if d["vol_ma5"] and float(d["vol_ma5"]) > 0 else 0
     vol20 = float(d["vol_ma20"]) if d["vol_ma20"] and float(d["vol_ma20"]) > 0 else 1
     vol_ratio = vol5 / vol20 if vol20 > 0 else 0
     if vol_ratio > cfg["volume_shrink_ratio"]:
-        return None
+        return None, f"量比过大(vol5/vol20={vol_ratio:.2f}> {cfg['volume_shrink_ratio']})"
     rs20 = float(d["ret20"]) - float(bench_ret20)
     if rs20 < cfg["min_rs20"]:
-        return None
+        return None, f"相对强度不足(rs20={rs20:.3f}< {cfg['min_rs20']})"
     ma60v = float(d["ma60"])
     trend_score = (ma60v / ma120v - 1) * 100
     shrink_score = (1 - vol_ratio) * 50
@@ -259,7 +325,7 @@ def score_one_gm(
         "atrp": float(d["atrp"]),
         "score": score,
         "setup": "pullback_ma120",
-    }
+    }, None
 
 
 def _get_ma20_from_bars(df: pd.DataFrame) -> float | None:
@@ -275,24 +341,30 @@ def _exit_reason(
     buy_price: float,
     high_curr: float,
     low_curr: float,
+    close_curr: float,
     stop_loss: float | None,
     take_profit: float | None,
     ma20_sell_price: float | None,
+    break_ma20_use_close: bool = True,
 ) -> str:
-    """与 backtest._exit_price_with_stop_target 一致，仅返回退出原因。"""
+    """
+    退出原因判断。
+    止损/止盈：用当日最低/最高价判断（盘中触及即触发）。
+    跌破 MA20：默认用收盘价判断，避免盘中下影线触及就卖（break_ma20_use_close=True）。
+    """
     stop_price = buy_price * (1.0 + stop_loss) if stop_loss is not None else None
     target_price = buy_price * (1.0 + take_profit) if take_profit is not None else None
-    below_candidates = []
-    if stop_price is not None:
-        below_candidates.append((stop_price, "stop_loss"))
-    if ma20_sell_price is not None and ma20_sell_price < buy_price:
-        below_candidates.append((ma20_sell_price, "break_ma20"))
-    below_candidates.sort(key=lambda x: -x[0])
-    for price, reason in below_candidates:
-        if low_curr <= price:
-            return reason
+    if stop_price is not None and low_curr <= stop_price:
+        return "stop_loss"
     if target_price is not None and high_curr >= target_price:
         return "take_profit"
+    if ma20_sell_price is not None and ma20_sell_price < buy_price:
+        if break_ma20_use_close:
+            if close_curr <= ma20_sell_price:
+                return "break_ma20"
+        else:
+            if low_curr <= ma20_sell_price:
+                return "break_ma20"
     return "normal"
 
 
@@ -319,7 +391,8 @@ def algo(context):
     config = context.config
     max_positions = config["max_positions"]
     pool_size = config["pool_size"]
-    adjust = ADJUST_PREV
+    # 与 backtest_adjust 一致：选股/基准用同一复权
+    adjust = ADJUST_NONE if config.get("backtest_adjust", 1) == 0 else ADJUST_PREV
 
     positions = context.account().positions(side=PositionSide_Long)
     held = {p.symbol for p in positions}
@@ -350,24 +423,35 @@ def algo(context):
             return
 
     cash = context.account().cash.nav
-    _log(f"[{cur}] 昨日={prev} 持仓={len(positions)} 只 现金={cash:,.0f}")
+    # 总资产（净值）：掘金 account 的 nav 为总资产，若无则用现金+持仓市值近似
+    total_nav = getattr(context.account(), "nav", None)
+    if total_nav is None and hasattr(context.account(), "cash"):
+        total_nav = cash + sum(getattr(p, "market_value", 0) or (getattr(p, "volume", 0) * getattr(p, "vwap", 0)) for p in positions)
+    if total_nav is None:
+        total_nav = cash
+    _log(f"[{cur}] 昨日={prev} 持仓={len(positions)} 只 现金={cash:,.0f} 总资产={total_nav:,.0f}")
 
+    # ---------- 卖出逻辑（满足任一即卖）----------
+    # 1) stop_loss: 当日最低价 <= 买入价*(1+stop_loss_pct)，如 -5% 止损
+    # 2) take_profit: 当日最高价 >= 买入价*(1+take_profit_pct)，如 +30% 止盈
+    # 3) drawdown_from_high: 当日收盘价 <= 买入后最高价*(1-drawdown_from_high_pct)，如回撤 10% 卖
     sell_reasons = []
     for p in positions:
         sym = p.symbol
         if sym not in context.positions_meta:
-            context.positions_meta[sym] = {"buy_date": cur, "buy_price": p.vwap}
+            context.positions_meta[sym] = {"buy_date": cur, "buy_price": p.vwap, "high_since_buy": p.vwap}
         buy_date = context.positions_meta[sym]["buy_date"]
         buy_price = context.positions_meta[sym].get("buy_price") or p.vwap
         if buy_date == cur:
             continue
+        adjust_sell = ADJUST_NONE if config.get("sell_bars_adjust", 1) == 0 else ADJUST_PREV
         try:
             bars = history_n(
                 symbol=sym,
                 frequency="1d",
                 count=30,
                 end_time=cur + " 15:00:00",
-                adjust=adjust,
+                adjust=adjust_sell,
                 df=True,
                 fields="open,high,low,close,volume,amount,eob",
             )
@@ -375,58 +459,64 @@ def algo(context):
             bars = None
         if bars is None or bars.empty:
             continue
-        high_t = float(bars["high"].iloc[-1]) if "high" in bars.columns else None
-        low_t = float(bars["low"].iloc[-1]) if "low" in bars.columns else None
-        if high_t is None or low_t is None:
+        # 按 eob 取「最新一根」K 线做卖出判断，避免 API 顺序导致取错日期
+        if "eob" in bars.columns:
+            bars = bars.copy()
+            bars["_eob_dt"] = pd.to_datetime(bars["eob"])
+            bars = bars.sort_values("_eob_dt", ascending=False).reset_index(drop=True)
+            row = bars.iloc[0]
+            bar_date = row["_eob_dt"].strftime("%Y-%m-%d") if hasattr(row["_eob_dt"], "strftime") else pd.Timestamp(row["_eob_dt"]).strftime("%Y-%m-%d")
+            high_t = float(row["high"]) if "high" in row.index else None
+            low_t = float(row["low"]) if "low" in row.index else None
+            close_t = float(row["close"]) if "close" in row.index else None
+        else:
+            bar_date = cur
+            high_t = float(bars["high"].iloc[-1]) if "high" in bars.columns else None
+            low_t = float(bars["low"].iloc[-1]) if "low" in bars.columns else None
+            close_t = float(bars["close"].iloc[-1]) if "close" in bars.columns else None
+        if high_t is None or low_t is None or close_t is None:
             continue
 
-        hold_days_cfg = config.get("hold_days")
-        hold_strong_pct = config.get("hold_strong_pct")
-        if hold_days_cfg is not None and hold_strong_pct is not None:
+        meta = context.positions_meta[sym]
+        # 回撤判断用「昨日及之前」的最高价，不含当日最高；且仅当曾涨过 drawdown_min_rise_pct 才启用
+        high_since_buy = meta.get("high_since_buy", buy_price)
+        drawdown_pct = config.get("drawdown_from_high_pct")
+        min_rise = config.get("drawdown_min_rise_pct")  # 例如 0.05：高点至少比成本高 5% 才看回撤
+        high_enough = min_rise is None or high_since_buy >= buy_price * (1.0 + min_rise)
+        if drawdown_pct is not None and high_enough and high_since_buy > 0 and close_t <= high_since_buy * (1.0 - drawdown_pct):
+            dd_pct = (1.0 - close_t / high_since_buy) * 100
+            _log(f"[{cur}] 卖出 {sym} 原因=高点回撤 用K线日期={bar_date} 复权={'不复权' if adjust_sell == ADJUST_NONE else '前复权'} 买入价={buy_price:.2f} 高点={high_since_buy:.2f} 收盘={close_t:.2f} 回撤={dd_pct:.1f}%")
+            sell_reasons.append((sym, "drawdown_from_high"))
             try:
-                dates_list = _trading_dates_between(EXCHANGE, buy_date, cur)
-                if buy_date in dates_list:
-                    idx_buy = dates_list.index(buy_date)
-                    held_days = len(dates_list) - 1 - idx_buy
-                    if held_days >= hold_days_cfg:
-                        highs = []
-                        for j in range(1, hold_days_cfg + 1):
-                            if idx_buy + j < len(dates_list):
-                                d = dates_list[idx_buy + j]
-                                b = history_n(sym, "1d", 5, end_time=d + " 15:00:00", adjust=adjust, df=True)
-                                if b is not None and not b.empty and "high" in b.columns:
-                                    highs.append(float(b["high"].iloc[-1]))
-                        if len(highs) == hold_days_cfg and all(h is not None for h in highs):
-                            threshold = buy_price * (1.0 + hold_strong_pct)
-                            if max(highs) < threshold:
-                                sell_reasons.append((sym, "weak_exit"))
-                                try:
-                                    order_volume(
-                                        symbol=sym,
-                                        volume=p.volume,
-                                        side=OrderSide_Sell,
-                                        order_type=OrderType_Market,
-                                        position_effect=PositionEffect_Close,
-                                    )
-                                except Exception:
-                                    pass
-                                continue
+                order_volume(
+                    symbol=sym,
+                    volume=p.volume,
+                    side=OrderSide_Sell,
+                    order_type=OrderType_Market,
+                    position_effect=PositionEffect_Close,
+                )
             except Exception:
                 pass
+            continue
+
+        # 更新买入后最高价（含当日），供下一日回撤判断用
+        meta["high_since_buy"] = max(meta.get("high_since_buy", buy_price), high_t)
 
         stop_loss = config.get("stop_loss_pct")
         take_profit = config.get("take_profit_pct")
-        break_ma20_pct = config.get("break_ma20_pct")
-        ma20_sell_price = None
-        if break_ma20_pct is not None:
-            ma20 = _get_ma20_from_bars(bars)
-            if ma20 is not None and ma20 > 0:
-                ma20_sell_price = ma20 * (1.0 - break_ma20_pct)
         reason = _exit_reason(
-            buy_price, high_t, low_t,
-            stop_loss, take_profit, ma20_sell_price,
+            buy_price, high_t, low_t, close_t,
+            stop_loss, take_profit, None,
+            break_ma20_use_close=True,
         )
         if reason != "normal":
+            adjust_label = "不复权" if adjust_sell == ADJUST_NONE else "前复权"
+            if reason == "stop_loss":
+                _log(f"[{cur}] 卖出 {sym} 原因=止损 用K线日期={bar_date} 复权={adjust_label} 高={high_t:.2f} 低={low_t:.2f} 收={close_t:.2f} 买入价={buy_price:.2f} 止损线={buy_price * (1.0 + stop_loss):.2f}")
+            elif reason == "take_profit":
+                _log(f"[{cur}] 卖出 {sym} 原因=止盈 用K线日期={bar_date} 复权={adjust_label} 高={high_t:.2f} 低={low_t:.2f} 收={close_t:.2f} 买入价={buy_price:.2f} 止盈线={buy_price * (1.0 + take_profit):.2f}")
+            else:
+                _log(f"[{cur}] 卖出 {sym} 原因={reason} 用K线日期={bar_date} 复权={adjust_label}")
             sell_reasons.append((sym, reason))
             try:
                 order_volume(
@@ -440,13 +530,14 @@ def algo(context):
                 pass
 
     if sell_reasons:
-        _log(f"[{cur}] 卖出 {len(sell_reasons)} 只: " + ", ".join(f"{s}({r})" for s, r in sell_reasons))
+        _log(f"[{cur}] 卖出汇总 {len(sell_reasons)} 只: " + ", ".join(f"{s}({r})" for s, r in sell_reasons))
 
     if context.next_buy_list and cash > 0:
         to_buy = [s for s in context.next_buy_list if s not in held][: max_positions - len(held)]
         if to_buy:
-            per_value = cash / len(to_buy)
-            _log(f"[{cur}] 买入 {len(to_buy)} 只 每只约{per_value:,.0f}元: {', '.join(to_buy)}")
+            # 每只仓位 = 账户总资产 / max_positions（等权）
+            per_value = total_nav / max_positions
+            _log(f"[{cur}] 买入 {len(to_buy)} 只 每只约{per_value:,.0f}元(总资产/{max_positions}): {', '.join(to_buy)}")
             for sym in to_buy:
                 try:
                     order_value(
@@ -464,11 +555,21 @@ def algo(context):
     if not symbols:
         _log(f"[{cur}] 选股日{prev} 成分股为空，跳过")
         return
+    _log(f"[{cur}] 选股开始 选股日={prev} 成分股数量={len(symbols)}")
+
     bench_ret = get_benchmark_ret20(context.benchmark_symbol, prev, adjust)
     if bench_ret is None:
         bench_ret = 0.0
+    if DEBUG_SELECTION:
+        _log(f"[{cur}] 基准{context.benchmark_symbol} 20日收益率={bench_ret:.4f}")
+
     scored_list = []
-    for sym in symbols:
+    fail_reasons = Counter()
+    bars_ok = 0
+    bars_fail = 0
+    for i, sym in enumerate(symbols):
+        if DEBUG_SELECTION and (i + 1) % 100 == 0:
+            _log(f"[{cur}] 选股进度 {i + 1}/{len(symbols)}")
         try:
             df_bar = history_n(
                 symbol=sym,
@@ -479,18 +580,32 @@ def algo(context):
                 df=True,
                 fields="open,high,low,close,volume,amount,eob",
             )
-        except Exception:
+        except Exception as e:
+            bars_fail += 1
+            if DEBUG_SELECTION and bars_fail <= 3:
+                _log(f"[选股] 获取日线异常 {sym}: {e}")
             continue
         if df_bar is None or df_bar.empty:
+            bars_fail += 1
             continue
         df_bar = gm_bar_to_df(df_bar, sym)
         if df_bar is None:
+            bars_fail += 1
             continue
-        r = score_one_gm(sym, df_bar, bench_ret, config)
+        bars_ok += 1
+        r, reason = score_one_gm(sym, df_bar, bench_ret, config)
         if r:
             scored_list.append(r)
+        elif reason:
+            fail_reasons[reason] += 1
+
+    if DEBUG_SELECTION:
+        _log(f"[{cur}] 选股统计: 成分股={len(symbols)} 获取日线成功={bars_ok} 获取日线失败={bars_fail} 入池={len(scored_list)}")
+        if fail_reasons:
+            _log(f"[{cur}] 未通过原因统计(前10): " + ", ".join(f"{k}({v})" for k, v in fail_reasons.most_common(10)))
+
     if not scored_list:
-        _log(f"[{cur}] 选股日{prev} 成分股{len(symbols)}只 入池0只")
+        _log(f"[{cur}] 选股日{prev} 成分股{len(symbols)}只 入池0只 请根据上方「未通过原因统计」调整条件或日期")
         context.next_buy_list = []
         return
     out = pd.DataFrame(scored_list).sort_values("score", ascending=False).drop_duplicates(subset=["code"], keep="first")
@@ -500,14 +615,16 @@ def algo(context):
 
 
 if __name__ == "__main__":
+    cfg = DEFAULT_CONFIG
+    _run_adjust = ADJUST_NONE if cfg.get("backtest_adjust", 1) == 0 else ADJUST_PREV
     run(
         strategy_id="gm_pullback_ma120",
-        filename="gm_pullback_ma120.py",
-        token=GM_TOKEN,
-        backtest_start_time=DEFAULT_CONFIG["backtest_start"] + " 09:00:00",
-        backtest_end_time=DEFAULT_CONFIG["backtest_end"] + " 15:00:00",
-        backtest_adjust=ADJUST_PREV,
-        backtest_initial_cash=DEFAULT_CONFIG["initial_capital"],
+        filename="main.py",
+        token='3ed29e8b09b04289ba1047ff089884a9a4117241',
+        backtest_start_time=cfg["backtest_start"] + " 09:00:00",
+        backtest_end_time=cfg["backtest_end"] + " 15:00:00",
+        backtest_adjust=_run_adjust,
+        backtest_initial_cash=cfg["initial_capital"],
         backtest_commission_ratio=0.0003,
         backtest_slippage_ratio=0.0001,
     )

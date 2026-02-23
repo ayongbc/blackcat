@@ -17,11 +17,13 @@ DEFAULT_CONFIG = {
     "min_bars": 180,
     "min_avg_amount_20": 5e7,
     "min_days_above_ma120": 60,
-    "min_ma60_above_ma120_days": 10,
-    "pullback_lookback": 10,
+    "min_ma60_above_ma120_days": 30,
+    "pullback_lookback": 5,
     "pullback_touch_tol": 0.01,
     "max_close_over_ma120": 1.05,
-    "max_breakdown_below_ma120": 0.03,  # 回踩期内最低价不得跌破 120MA 超过此比例，排除破位后反弹
+    "max_breakdown_below_ma120": 0.03,  # 回踩期内最低价不得跌破 120MA 超过此比例（旧逻辑）
+    "pullback_low_min_ma120": 0.98,   # 最近 N 天收盘价 >= MA120 * 此值（回踩在线上方）
+    "pullback_low_max_ma120": 1.02,   # 最近 N 天最低价 <= MA120 * 此值（不破线过深）
     "min_ma120_rise_60d": 0.03,  # 当日 120MA 比 60 天前高至少此比例（如 3%），确保长均线上升
     "volume_shrink_ratio": 0.85,
     "min_rs20": 0.0,
@@ -107,26 +109,38 @@ def _score_one(df: pd.DataFrame, bench_ret20: float, config: dict) -> dict[str, 
         if ma120_today < ma120_60d_ago * (1 + min_rise):
             return None
 
-    # 持续 n 天维持在回踩状态：最近 n 天每日收盘均在 120MA 附近企稳
+    # 回踩区：支持两种参数（与 gm 版一致时用 pullback_low_min_ma120 / pullback_low_max_ma120）
     lookback = cfg["pullback_lookback"]
-    tol = cfg["pullback_touch_tol"]
-    max_over = cfg["max_close_over_ma120"]
-    max_breakdown = cfg.get("max_breakdown_below_ma120", 0.03)
     recent = df.iloc[-lookback:]
-    in_pullback_zone = (
-        (recent["close"] >= recent["ma120"] * (1 - tol))
-        & (recent["close"] <= recent["ma120"] * max_over)
-    )
-    if not in_pullback_zone.all():
-        return None
-    # 排除破位后反弹：回踩期内最低价不得跌破 120MA 超过 max_breakdown（如 3%）
-    if (recent["low"] < recent["ma120"] * (1 - max_breakdown)).any():
-        return None
+    low_min = cfg.get("pullback_low_min_ma120")
+    low_max = cfg.get("pullback_low_max_ma120")
+    if low_min is not None and low_max is not None:
+        # 与 gm 一致：最近 N 天 最低价 <= MA120*low_max，且 收盘价 >= MA120*low_min
+        low_ok = recent["low"] <= recent["ma120"] * low_max
+        close_ok = recent["close"] >= recent["ma120"] * low_min
+        if not (low_ok & close_ok).all():
+            return None
+    else:
+        # 旧逻辑：tol / max_over / max_breakdown
+        tol = cfg["pullback_touch_tol"]
+        max_over = cfg["max_close_over_ma120"]
+        max_breakdown = cfg.get("max_breakdown_below_ma120", 0.03)
+        in_pullback_zone = (
+            (recent["close"] >= recent["ma120"] * (1 - tol))
+            & (recent["close"] <= recent["ma120"] * max_over)
+        )
+        if not in_pullback_zone.all():
+            return None
+        if (recent["low"] < recent["ma120"] * (1 - max_breakdown)).any():
+            return None
 
     close = float(d["close"])
     ma120v = float(d["ma120"])
-    if close <= ma120v * (1 - tol) or close / ma120v > max_over:
-        return None
+    if low_min is None or low_max is None:
+        tol = cfg["pullback_touch_tol"]
+        max_over = cfg["max_close_over_ma120"]
+        if close <= ma120v * (1 - tol) or close / ma120v > max_over:
+            return None
 
     vol5 = float(d["vol_ma5"]) if d["vol_ma5"] and float(d["vol_ma5"]) > 0 else 0
     vol20 = float(d["vol_ma20"]) if d["vol_ma20"] and float(d["vol_ma20"]) > 0 else 1

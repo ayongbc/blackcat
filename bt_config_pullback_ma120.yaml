@@ -10,10 +10,14 @@ strategy_params:
   min_bars: 180              # K 线最少条数（需覆盖 120MA + 缓冲）
   min_days_above_ma120: 60   # 股价 > 120MA 连续天数
   min_ma60_above_ma120_days: 30  # 60MA > 120MA 至少维持天数
-  pullback_lookback: 5      # 持续回踩天数：最近 n 天收盘均在 120MA 附近企稳
-  pullback_touch_tol: 0.02   # 回踩区下界：close >= ma120*(1-tol)
-  max_close_over_ma120: 1.05 # 收盘相对 120MA 上限（5%），防追高
-  max_breakdown_below_ma120: 0.03  # 回踩期内最低价不得跌破 120MA 超过 3%，排除破位后反弹
+  pullback_lookback: 5      # 持续回踩天数：最近 n 天满足回踩区条件
+  # 回踩区（与 gm 版一致）：最近 N 天 最低价<=MA120*pullback_low_max_ma120 且 收盘>=MA120*pullback_low_min_ma120
+  pullback_low_min_ma120: 0.98   # 收盘 >= MA120*此值（在线上方）
+  pullback_low_max_ma120: 1.02   # 最低价 <= MA120*此值（不破线过深）
+  # 以下为旧版回踩参数，当上面两项存在时不再使用
+  pullback_touch_tol: 0.02
+  max_close_over_ma120: 1.05
+  max_breakdown_below_ma120: 0.03
   min_ma120_rise_60d: 0.03        # 当日 120MA 比 60 天前高至少 3%，确保长均线上升
   volume_shrink_ratio: 0.85  # 缩量：vol5/vol20 需 <= 此值
   min_rs20: 0.0              # 相对强度下限（相对基准 20 日收益）
