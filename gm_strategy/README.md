@@ -2,11 +2,60 @@
 
 本目录为**掘金量化**平台独立策略，与仓库内 `strategies/pullback_ma120.py` 及 `bt_config_pullback_ma120.yaml` 逻辑一致，仅依赖 `gm`（掘金 SDK）和 `pandas`，不依赖本仓库的 baostock/akshare/data.*。
 
-## 依赖
+## 依赖与安装
+
+**重要**：掘金官方 Python SDK (`gm`) **不支持 macOS**（无 Mac 适用 wheel，pip 会报 “No matching distribution”）。若你使用 Mac，可：
+- 在 **Windows / Linux** 机器或虚拟机、WSL2 中安装运行；
+- 或使用掘金官方的 **「掘金终端」**（Windows）进行策略编写与回测；
+- 本仓库主流程（`run_daily`、`backtest`、`supplement_kline` 等）不依赖 gm，可在 Mac 上正常使用。
+
+**若在 Windows/Linux 安装**：掘金 SDK 还要求 **pandas&lt;2.0**、**numpy&lt;2.0**，与主项目 `.venv`（pandas≥2）冲突，因此建议**单独虚拟环境**。
+
+在项目根目录执行（只需一次）：
 
 ```bash
+# 新建仅用于掘金的虚拟环境
+python3 -m venv .venv_gm
+# 激活并安装
+source .venv_gm/bin/activate   # Windows: .venv_gm\Scripts\activate
 pip install gm pandas
 ```
+
+运行本目录脚本时使用该环境：
+
+```bash
+# 在项目根目录
+.venv_gm/bin/python gm_strategy/gm_pullback_ma120.py
+.venv_gm/bin/python gm_strategy/query_fundamentals.py SHSE.600000
+```
+
+**若 `pip install gm` 报错 “No matching distribution found / versions: none”**（常见于 macOS 或网络限制）：
+
+1. **用国内镜像安装**（推荐先试）：
+   ```bash
+   source .venv_gm/bin/activate
+   pip install gm -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+   ```
+2. **或运行项目自带安装脚本**（会先打印环境信息，再用清华源安装）：
+   ```bash
+   bash scripts/install_gm.sh
+   ```
+3. **若出现 SSL 错误**（如 `SSLEOFError`、`SSLCertVerificationError`）：先试跳过证书校验（仅限可信网络）：
+   ```bash
+   source .venv_gm/bin/activate
+   pip install gm --trusted-host pypi.org --trusted-host files.pythonhosted.org
+   ```
+4. **若仍失败（SSL 完全无法建立）**：用浏览器手动下载 wheel 再本地安装（不经过 pip 的 HTTPS）：
+   - 打开 https://pypi.org/project/gm/#files ，按你的系统选对应文件（如 macOS：`macosx_*`，Python 3.10：`cp310`）。
+   - 下载 `.whl` 到本机后执行（将路径换成你下载的位置）：
+   ```bash
+   source .venv_gm/bin/activate
+   pip install ~/Downloads/gm-3.0.183-xxx.whl
+   ```
+5. **Mac 用户**：掘金 SDK 当前不支持 macOS，需在 Windows/Linux 或虚拟机中运行本目录脚本，或使用掘金终端（Windows）。
+6. **其他**：可到 [掘金官网](https://www.myquant.cn/) 下载「掘金终端」或官方 Python SDK 安装包，按文档安装。
+
+若你希望与主环境共用，可尝试在主 `.venv` 中 `pip install gm`（会触发 pandas/numpy 降级，可能影响主项目回测）。
 
 ## Token 配置
 
